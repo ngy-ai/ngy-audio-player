@@ -38,6 +38,13 @@ rustfft = "6"
 # 原生文件 / 文件夹选择对话框。注意它是**阻塞**的，必须在后台线程上弹。
 rfd = "0.15"
 
+# 把已经打开的文件对话框重新提到前台。rfd 已经依赖同一版本，这里只是直接用它的绑定。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 gpui-kit = { version = "0.8", features = ["test-support"] }
 

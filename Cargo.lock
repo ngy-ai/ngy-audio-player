@@ -4512,6 +4512,7 @@ dependencies = [
  "ngy-audio-engine",
  "rfd",
  "rustfft",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

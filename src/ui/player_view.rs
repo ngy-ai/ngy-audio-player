@@ -23,6 +23,8 @@ const SPECTRUM_BANDS: usize = 44;
 const SPECTRUM_HEIGHT: f32 = 96.0;
 /// 定时刷新间隔。频谱要跳得顺，但也没必要每帧算 FFT。
 const TICK: Duration = Duration::from_millis(80);
+/// 文件对话框标题。重复点击时靠它找回已经打开的窗口。
+const FILE_DIALOG_TITLE: &str = "选择音频文件";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepeatMode {
@@ -74,7 +76,7 @@ pub struct PlayerView {
     dark: bool,
     /// 一次性提示（例如「这个格式需要 ffmpeg」），过几秒自动消失。
     notice: Option<(String, Instant)>,
-    /// 文件选择框已经打开：原生对话框是阻塞调用，连点会叠出多个窗口。
+    /// 文件选择框已经打开：连点会叠出多个窗口，重复点击只把已有窗口提到前台。
     file_dialog_open: bool,
     focus: FocusHandle,
 }
@@ -398,6 +400,7 @@ impl PlayerView {
 
     fn open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.file_dialog_open {
+            focus_file_dialog();
             return;
         }
         self.file_dialog_open = true;
@@ -406,7 +409,7 @@ impl PlayerView {
             rfd::FileDialog::new()
                 .add_filter("音频文件", extensions)
                 .add_filter("所有文件", &["*"])
-                .set_title("选择音频文件")
+                .set_title(FILE_DIALOG_TITLE)
                 .pick_files()
                 .unwrap_or_default()
         });
@@ -475,6 +478,33 @@ fn value_value(value: &SliderValue) -> Option<f32> {
         SliderValue::Range(start, _) => Some(*start),
     }
 }
+
+/// 把已经打开的原生文件对话框提到前台。
+#[cfg(windows)]
+fn focus_file_dialog() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    let title: Vec<u16> = FILE_DIALOG_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: 标题是以 NUL 结尾的 UTF-16 字符串；句柄只传给 user32 做窗口激活。
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+fn focus_file_dialog() {}
 
 fn scan_folder(folder: &std::path::Path) -> Vec<PathBuf> {
     // 只扫两层：音乐库通常就是「专辑/曲目」两层，再深多半是在扫游戏资源目录。
