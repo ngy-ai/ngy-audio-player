@@ -74,6 +74,8 @@ pub struct PlayerView {
     dark: bool,
     /// 一次性提示（例如「这个格式需要 ffmpeg」），过几秒自动消失。
     notice: Option<(String, Instant)>,
+    /// 文件选择框已经打开：原生对话框是阻塞调用，连点会叠出多个窗口。
+    file_dialog_open: bool,
     focus: FocusHandle,
 }
 
@@ -164,6 +166,7 @@ impl PlayerView {
             has_ffmpeg: ngy_audio_engine::has_ffmpeg(),
             dark,
             notice: None,
+            file_dialog_open: false,
             focus,
         };
 
@@ -394,6 +397,10 @@ impl PlayerView {
     }
 
     fn open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_dialog_open {
+            return;
+        }
+        self.file_dialog_open = true;
         let extensions = format::dialog_extensions();
         let task = cx.background_executor().spawn(async move {
             rfd::FileDialog::new()
@@ -405,10 +412,13 @@ impl PlayerView {
         });
         cx.spawn_in(window, async move |this, cx| {
             let files = task.await;
-            if files.is_empty() {
-                return;
-            }
-            let _ = this.update_in(cx, |this, window, cx| this.add_paths(files, true, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.file_dialog_open = false;
+                if files.is_empty() {
+                    return;
+                }
+                this.add_paths(files, true, window, cx);
+            });
         })
         .detach();
     }
