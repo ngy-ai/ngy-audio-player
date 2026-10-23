@@ -644,20 +644,7 @@ impl Render for PlayerView {
                         .items_center()
                         .gap_3()
                         .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-                        .child(
-                            div()
-                                .size(px(28.0))
-                                .rounded_md()
-                                .bg(primary)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::new(IconName::Music)
-                                        .size(px(16.0))
-                                        .text_color(background),
-                                ),
-                        )
+                        .child(img("app-icon.png").size(px(28.0)).flex_shrink_0())
                         .child(
                             v_flex()
                                 .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("声波"))

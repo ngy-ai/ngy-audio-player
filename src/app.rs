@@ -1,6 +1,7 @@
 //! 应用启动。窗口装配只做三件事：初始化 gpui-kit、跟随系统外观、把主视图塞进 Root。
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use gpui_kit::component::*;
 use gpui_kit::{AssetSource, Result as AssetResult, SharedString};
@@ -10,6 +11,8 @@ use crate::ui::PlayerView;
 
 const APP_NAME: &str = "声波";
 const DEFAULT_SIZE: (f32, f32) = (1120.0, 760.0);
+/// 标题栏和 X11 窗口图标共用这一张；Windows 的任务栏 / exe 图标由 build.rs 嵌入。
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 /// 资源源：先用完整 Lucide 图标目录，再退回 gpui-kit 的默认资源。
 ///
@@ -21,6 +24,9 @@ struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> AssetResult<Option<Cow<'static, [u8]>>> {
+        if path == "app-icon.png" {
+            return Ok(Some(Cow::Borrowed(APP_ICON_PNG)));
+        }
         match gpui_kit::assets::AllAssets.load(path) {
             Ok(Some(data)) => Ok(Some(data)),
             _ => gpui_kit::assets::Assets.load(path),
@@ -45,6 +51,7 @@ pub fn run() -> anyhow::Result<()> {
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(initial_bounds(cx))),
+            icon: window_icon(),
             titlebar: Some(TitlebarOptions {
                 title: Some(APP_NAME.into()),
                 appears_transparent: true,
@@ -80,6 +87,14 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// X11 的窗口图标（Windows / macOS 会忽略这个字段）。
+fn window_icon() -> Option<Arc<image::RgbaImage>> {
+    let icon = image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png)
+        .ok()?
+        .to_rgba8();
+    Some(Arc::new(icon))
 }
 
 /// 首次打开的窗口位置：屏幕中央，且不超过屏幕的 90%。

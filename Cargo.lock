@@ -4506,6 +4506,7 @@ name = "ngy-audio-player"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embed-resource",
  "gpui-kit",
  "image",
  "ngy-audio-engine",
