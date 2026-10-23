@@ -175,7 +175,7 @@ impl PlayerView {
             .collect();
         let mut this = this;
         if !args.is_empty() {
-            this.add_paths(args, window, cx);
+            this.add_paths(args, false, window, cx);
         }
 
         // 唯一一个常驻任务：定时读引擎状态、推动进度条、喂频谱。
@@ -324,7 +324,14 @@ impl PlayerView {
         .detach();
     }
 
-    fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    /// `play_first` 为真时，无论当前是否在播，都立刻切到这批文件的第一首。
+    fn add_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        play_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut paths: Vec<PathBuf> = paths
             .into_iter()
             .filter(|path| format::is_audio_path(path))
@@ -378,7 +385,7 @@ impl PlayerView {
         })
         .detach();
 
-        if self.current.is_none() {
+        if play_first || self.current.is_none() {
             self.play_index(start, window, cx);
         } else {
             self.notice = Some((format!("已加入 {count} 首"), Instant::now()));
@@ -401,7 +408,7 @@ impl PlayerView {
             if files.is_empty() {
                 return;
             }
-            let _ = this.update_in(cx, |this, window, cx| this.add_paths(files, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.add_paths(files, true, window, cx));
         })
         .detach();
     }
@@ -419,7 +426,7 @@ impl PlayerView {
             if files.is_empty() {
                 return;
             }
-            let _ = this.update_in(cx, |this, window, cx| this.add_paths(files, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.add_paths(files, false, window, cx));
         })
         .detach();
     }
@@ -603,7 +610,7 @@ impl Render for PlayerView {
                 }
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.add_paths(paths.paths().to_vec(), window, cx);
+                this.add_paths(paths.paths().to_vec(), true, window, cx);
             }));
 
         // —— 顶部 ——
@@ -1091,7 +1098,7 @@ mod tests {
             let slot = slot.clone();
             cx.add_window(move |window, cx| {
                 let view = cx.new(|cx| PlayerView::new(window, cx));
-                view.update(cx, |view, cx| view.add_paths(paths.clone(), window, cx));
+                view.update(cx, |view, cx| view.add_paths(paths.clone(), false, window, cx));
                 *slot.borrow_mut() = Some(view.clone());
                 Harness { view }
             })
@@ -1119,6 +1126,49 @@ mod tests {
 
         let current = cx.update(|app| view.read(app).current);
         assert_eq!(current, Some(1), "点第二行之后当前曲目应当是它");
+    }
+
+    #[gpui_kit::test]
+    fn opening_a_file_switches_to_it_immediately(cx: &mut TestAppContext) {
+        let paths = samples();
+        if paths.len() < 3 {
+            eprintln!("跳过：缺少 testdata 样本");
+            return;
+        }
+
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let first_two = paths[..2].to_vec();
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, cx| view.add_paths(first_two.clone(), false, window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        assert_eq!(cx.update(|app| view.read(app).current), Some(0));
+
+        let third = paths[2].clone();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |view, cx| view.add_paths(vec![third], true, window, cx));
+        })
+        .unwrap();
+
+        assert_eq!(
+            cx.update(|app| view.read(app).current),
+            Some(2),
+            "打开文件后应当直接播它，而不是只加进列表"
+        );
     }
 
     #[gpui_kit::test]
