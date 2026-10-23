@@ -1,0 +1,28 @@
+[package]
+name = "ngy-audio-engine"
+version = "0.1.0"
+edition = "2024"
+description = "音频播放内核：Symphonia + 系统 ffmpeg 双层解码，cpal 输出"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+
+# 内置解码器：纯 Rust，无 C 依赖。
+# `all` = all-codecs（aac/adpcm/alac/flac/mp1/mp2/mp3/pcm/vorbis）
+#       + all-formats（caf/isomp4/mkv/ogg/aiff/wav）+ all-meta（ape/id3v1/id3v2）。
+# 它**不含** Opus / WMA / APE 音频 / DSD / AMR / AC3 —— 这些交给 ffmpeg 兜底。
+symphonia = { version = "0.6", features = ["all"] }
+
+# 音频输出：WASAPI（Windows）/ CoreAudio（macOS）/ ALSA（Linux）统一接口。
+cpal = "0.18"
+
+# 解码线程 → 音频回调之间的无锁单生产者单消费者队列。
+ringbuf = "0.4"
+
+# 采样率转换：设备几乎总是 48k，而素材可能是 44.1k/96k/192k。
+# 固定比例用 FFT 重采样，比线性插值少了整段高频镜像。
+rubato = "5"
+
+# 标签与内嵌封面：mp3/flac/ogg/opus/m4a/wav/aiff/wv/ape 等都能读。
+lofty = "0.22"
