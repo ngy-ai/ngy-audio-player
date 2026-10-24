@@ -106,4 +106,30 @@ fn plays_a_tone_and_advances_position() {
         ended.position,
         ended.duration
     );
+
+    // 播完之后再拖进度条：解码会话已经丢掉，应该重新开流并落到目标附近，
+    // 而不是静默忽略、让进度条卡在末尾。
+    player.seek(0.3);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut resumed = player.snapshot();
+    while Instant::now() < deadline
+        && (resumed.state == PlaybackState::Ended || resumed.state == PlaybackState::Loading)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        resumed = player.snapshot();
+    }
+    println!(
+        "结束后 seek 状态={:?} 位置={:.3}s",
+        resumed.state, resumed.position
+    );
+    assert_ne!(
+        resumed.state,
+        PlaybackState::Ended,
+        "结束后 seek 没有重新开流"
+    );
+    assert!(
+        (0.25..0.9).contains(&resumed.position),
+        "结束后 seek 没有落到目标附近：{:.3}s",
+        resumed.position
+    );
 }

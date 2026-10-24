@@ -1,7 +1,7 @@
 //! 播放引擎与 UI 之间唯一的共享面：全是原子量 / 短锁，音频回调里不加阻塞锁。
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::decode::Backend;
 use crate::meta::TrackMeta;
@@ -52,6 +52,9 @@ pub struct Shared {
     pub failed: Mutex<Option<String>>,
     pub track: Mutex<Option<std::sync::Arc<TrackMeta>>>,
     pub backend: Mutex<Option<Backend>>,
+    /// 最近一次标签探测结果。探测在后台线程跑，可能比 `Load` 命令先完成；
+    /// 先记下来，等真正装载同一路径时再补，避免时长永远停在 0。
+    probed: Mutex<Option<std::sync::Arc<TrackMeta>>>,
 
     /// seek 后的新原点（毫秒）。与 `seek_epoch` 配合，让音频回调知道该清零计数。
     pub baseline_ms: AtomicU64,
@@ -87,6 +90,7 @@ impl Shared {
             failed: Mutex::new(None),
             track: Mutex::new(None),
             backend: Mutex::new(None),
+            probed: Mutex::new(None),
             baseline_ms: AtomicU64::new(0),
             seek_epoch: AtomicU64::new(0),
             position_ms: AtomicU64::new(0),
@@ -111,7 +115,10 @@ impl Shared {
     }
 
     pub fn device_name(&self) -> String {
-        self.device.lock().map(|name| name.clone()).unwrap_or_default()
+        self.device
+            .lock()
+            .map(|name| name.clone())
+            .unwrap_or_default()
     }
 
     /// 音频回调是否应该往外送样本。
@@ -207,6 +214,15 @@ impl Shared {
     // —— 解码线程用的写入 ——
 
     pub(crate) fn begin_load(&self, track: std::sync::Arc<TrackMeta>) {
+        // 标签探测是异步的，可能比这条 Load 命令先到（小文件、刚启动时很常见）。
+        // 那次 refresh_track 会因为还没有「当前曲目」而被丢掉，这里把它捡回来。
+        let track = self
+            .probed
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .filter(|probed| probed.path == track.path)
+            .unwrap_or(track);
         self.clear_error();
         self.active.store(false, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
@@ -237,13 +253,23 @@ impl Shared {
     /// 只更新列表是不够的：引擎里存的还是占位曲目，快照的时长就是 0，进度条
     /// 没有比例、总时长显示 0:00。这里顺手把时长也补上。
     pub(crate) fn refresh_track(&self, track: std::sync::Arc<TrackMeta>) {
+        // 先记下来：即使当前还没装载这首，后面的 begin_load 也能补上时长。
+        if let Ok(mut slot) = self.probed.lock() {
+            *slot = Some(track.clone());
+        }
+
         let matches_current = self
             .track
             .lock()
-            .map(|slot| {
-                slot.as_ref()
+            .map(|mut slot| {
+                let matches = slot
+                    .as_ref()
                     .map(|current| current.path == track.path)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if matches {
+                    *slot = Some(track.clone());
+                }
+                matches
             })
             .unwrap_or(false);
         if !matches_current {
@@ -253,9 +279,6 @@ impl Shared {
         if let Some(duration) = track.duration {
             self.duration_ms
                 .store(duration.as_millis() as u64, Ordering::Relaxed);
-        }
-        if let Ok(mut slot) = self.track.lock() {
-            *slot = Some(track);
         }
     }
 
@@ -276,5 +299,49 @@ impl Shared {
             return;
         }
         self.finished_serial.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn track(path: &str, duration: Option<Duration>) -> std::sync::Arc<TrackMeta> {
+        let mut meta = TrackMeta::placeholder(Path::new(path));
+        meta.duration = duration;
+        std::sync::Arc::new(meta)
+    }
+
+    #[test]
+    fn metadata_probed_before_load_is_not_lost() {
+        let shared = Shared::new("测试设备".into());
+        let path = "C:/music/sample.wav";
+
+        // 后台探测先回来：此时引擎里还没有「当前曲目」，旧逻辑会直接丢掉。
+        shared.refresh_track(track(path, Some(Duration::from_secs(41))));
+        assert_eq!(shared.snapshot().duration, 0.0);
+
+        // Load 命令随后才到，拿的还是占位曲目；应该把探测结果补回来。
+        shared.begin_load(track(path, None));
+        assert_eq!(shared.snapshot().duration, 41.0);
+        assert_eq!(
+            shared.snapshot().track.and_then(|track| track.duration),
+            Some(Duration::from_secs(41))
+        );
+    }
+
+    #[test]
+    fn probe_result_for_another_track_is_not_applied() {
+        let shared = Shared::new("测试设备".into());
+        let path = PathBuf::from("C:/music/a.wav");
+        shared.begin_load(track(path.to_str().unwrap(), None));
+
+        shared.refresh_track(track("C:/music/b.wav", Some(Duration::from_secs(3))));
+        assert_eq!(shared.snapshot().duration, 0.0);
+
+        shared.refresh_track(track(path.to_str().unwrap(), Some(Duration::from_secs(7))));
+        assert_eq!(shared.snapshot().duration, 7.0);
     }
 }

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use ngy_audio_engine::decode;
 use ngy_audio_engine::format;
+use ngy_audio_engine::meta::TrackMeta;
 
 fn testdata_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -75,7 +76,11 @@ fn every_sample_decodes_with_reasonable_length() {
         }
     }
 
-    assert!(failures.is_empty(), "有格式解码失败：\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "有格式解码失败：\n{}",
+        failures.join("\n")
+    );
     // 两条路径都得真的被用到，否则「双层解码」只是纸面上的。
     assert!(used_symphonia > 0, "没有任何样本走内置解码器");
     assert!(used_ffmpeg > 0, "没有任何样本走 ffmpeg 兜底");
@@ -92,8 +97,44 @@ fn seek_lands_near_target() {
 
     let mut decoder = decode::open(&path, 48_000).expect("打开 flac 失败");
     decoder.seek(Duration::from_millis(800)).expect("seek 失败");
-    let chunk = decoder.next_chunk().expect("解码失败").expect("seek 后没有数据");
+    let chunk = decoder
+        .next_chunk()
+        .expect("解码失败")
+        .expect("seek 后没有数据");
     assert!(!chunk.is_empty(), "seek 之后读不到样本");
+}
+
+#[test]
+fn seek_to_reported_duration_does_not_go_out_of_range() {
+    let dir = testdata_dir();
+    if !dir.is_dir() {
+        eprintln!("跳过：没有 testdata 目录");
+        return;
+    }
+
+    let mut checked = 0;
+    for name in ["tone.wav", "tone.flac", "tone.mp3", "tone.ogg", "demo.mp3"] {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        // 用户拖到最右边时，UI 用的就是标签探测出来的时长；它常比容器
+        // 真实帧数长几十毫秒，直接拿去 seek 会 out-of-range。
+        let duration = TrackMeta::probe(&path)
+            .duration
+            .unwrap_or_else(|| panic!("{name} 探测不出时长"));
+        let mut decoder = decode::open(&path, 48_000)
+            .unwrap_or_else(|error| panic!("{name} 打开失败：{error:#}"));
+        decoder
+            .seek(duration)
+            .unwrap_or_else(|error| panic!("{name} 拖到末尾 seek 失败：{error:#}"));
+        assert!(
+            decoder.next_chunk().expect("seek 后解码失败").is_some(),
+            "{name} 拖到末尾后读不到数据"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "testdata 里没有可用于 seek 的样本");
 }
 
 #[test]
@@ -108,8 +149,14 @@ fn unsupported_garbage_reports_both_reasons() {
     };
     let message = format!("{error:#}");
     // 两条路径的原因都要能看到，否则用户只知道「失败了」不知道「为什么」。
-    assert!(message.contains("内置解码器"), "错误里缺少内置解码器的原因：{message}");
-    assert!(message.contains("ffmpeg"), "错误里缺少 ffmpeg 的原因：{message}");
+    assert!(
+        message.contains("内置解码器"),
+        "错误里缺少内置解码器的原因：{message}"
+    );
+    assert!(
+        message.contains("ffmpeg"),
+        "错误里缺少 ffmpeg 的原因：{message}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }

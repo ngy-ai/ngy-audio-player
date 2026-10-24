@@ -10,16 +10,20 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::units::Time;
+use symphonia::core::units::{Duration as UnitsDuration, Time};
 
 use super::{Backend, Decoder, StreamSpec, to_stereo};
+
+/// 末尾留的余量。几个解码器在精确末帧 seek 会报 EOF / out-of-range，
+/// 而标签探测出的时长又常比容器真实帧数长几毫秒到几十毫秒。
+const SEEK_END_MARGIN: Duration = Duration::from_millis(50);
 
 pub struct SymphoniaDecoder {
     reader: Box<dyn FormatReader>,
@@ -30,6 +34,8 @@ pub struct SymphoniaDecoder {
     spec: StreamSpec,
     interleaved: Vec<f32>,
     stereo: Vec<f32>,
+    /// 容器真实可 seek 的上界；元数据时长不可信时用它兜底。
+    seek_end: Option<Duration>,
     /// 打开时试解出来的第一块，不能丢。
     primer: Option<Vec<f32>>,
 }
@@ -44,7 +50,12 @@ pub fn open(path: &Path) -> anyhow::Result<Box<dyn Decoder>> {
     }
 
     let reader = symphonia::default::get_probe()
-        .probe(&hint, stream, FormatOptions::default(), MetadataOptions::default())
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
         .with_context(|| format!("内置解码器不认识的容器：{}", path.display()))?;
 
     let track = reader
@@ -77,6 +88,9 @@ pub fn open(path: &Path) -> anyhow::Result<Box<dyn Decoder>> {
         .filter(|count| *count > 0)
         .unwrap_or(2);
 
+    // 在把 reader 移进结构体之前先算好，顺便避开借用冲突。
+    let seek_end = seekable_end(track);
+
     let mut decoder = SymphoniaDecoder {
         reader,
         decoder,
@@ -85,6 +99,7 @@ pub fn open(path: &Path) -> anyhow::Result<Box<dyn Decoder>> {
         spec: StreamSpec { rate, channels: 2 },
         interleaved: Vec::new(),
         stereo: Vec::new(),
+        seek_end,
         primer: None,
     };
 
@@ -156,14 +171,36 @@ impl Decoder for SymphoniaDecoder {
     }
 
     fn seek(&mut self, to: Duration) -> anyhow::Result<()> {
+        // 标签/ffprobe 报的时长可能比容器真实帧数长（编码器延迟、尾部 padding
+        // 都算进去了）。直接拿它 seek 到最右边，Symphonia 会判 out-of-range。
+        // 这里按容器自己的帧数收一收，并给末帧留点余量。
+        let to = match self.seek_end {
+            Some(end) => to.min(end.saturating_sub(SEEK_END_MARGIN)),
+            None => to,
+        };
         let time = Time::try_new(to.as_secs() as i64, to.subsec_nanos())
             .context("seek 目标超出可表示范围")?;
         self.reader.seek(
             SeekMode::Accurate,
-            SeekTo::Time { time, track_id: Some(self.track_id) },
+            SeekTo::Time {
+                time,
+                track_id: Some(self.track_id),
+            },
         )?;
-        // seek 之后解码器状态与新的包不连续，必须 reset。
+        // seek 之后解码器状态与新的包不连续，必须 reset；打开时试解的那块
+        // 属于旧位置，也必须丢掉，否则会先响一下开头。
         self.decoder.reset();
+        self.primer = None;
         Ok(())
     }
+}
+
+/// 容器里真实可 seek 的上界（秒）。
+fn seekable_end(track: &Track) -> Option<Duration> {
+    let time_base = track.time_base?;
+    let frames = track.num_frames?;
+    let end_ts = track.start_ts.checked_add(UnitsDuration::from(frames))?;
+    let end = time_base.calc_time(end_ts)?;
+    let seconds = end.as_secs_f64();
+    (seconds > 0.0).then(|| Duration::from_secs_f64(seconds))
 }

@@ -49,7 +49,12 @@ impl Player {
             .spawn(move || decode_loop(worker_shared, command_rx, producer, target_rate))
             .context("启动解码线程失败")?;
 
-        Ok(Self { shared, command_tx, _stream: stream, config })
+        Ok(Self {
+            shared,
+            command_tx,
+            _stream: stream,
+            config,
+        })
     }
 
     pub fn config(&self) -> &OutputConfig {
@@ -95,10 +100,10 @@ impl Player {
     }
 
     /// 跳到 `seconds` 秒。
+    ///
+    /// 位置要等解码线程真的 seek 成功才更新：失败时进度条不该跳到一个
+    /// 其实没到达的地方，否则用户会以为「跳过去了但没声音」。
     pub fn seek(&self, seconds: f64) {
-        // UI 立刻响应：不等解码线程处理命令。
-        self.shared.seek_to(seconds);
-        self.shared.flush.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.command_tx.send(Command::Seek(seconds));
     }
 
@@ -185,7 +190,14 @@ fn decode_loop(
                         .paused
                         .store(paused, std::sync::atomic::Ordering::Relaxed);
                     if !paused && shared.ended.load(std::sync::atomic::Ordering::Relaxed) {
-                        // 在「播完」状态按播放：从头再来。
+                        // 在「播完」状态按播放：从头再来。最后一首播完后会话已经
+                        // 丢掉，先重新开流；自动切歌时 Load 会先清掉 ended，不走这里。
+                        if session.is_none()
+                            && let Some(track) =
+                                shared.track.lock().ok().and_then(|slot| slot.clone())
+                        {
+                            session = start_session(&shared, track, target_rate);
+                        }
                         if let Some(session) = session.as_mut() {
                             let _ = session.decoder.seek(Duration::ZERO);
                             if let Some(resampler) = session.resampler.as_mut() {
@@ -193,6 +205,8 @@ fn decode_loop(
                             }
                             session.finished = false;
                             session.drain_deadline = None;
+                            // 播完时可能还剩一点重采样尾巴没推完，别让它在新一轮开头响。
+                            session.pending.clear();
                             shared.seek_to(0.0);
                             shared
                                 .ended
@@ -201,8 +215,17 @@ fn decode_loop(
                     }
                 }
                 Command::Seek(seconds) => {
+                    let seconds = seconds.max(0.0);
+                    // 播完之后会话已经丢掉（最后一遍播完就停在这里，切歌由 UI 负责）。
+                    // 这时拖动进度条应该重新开流，而不是什么都不发生。
+                    if session.is_none()
+                        && shared.ended.load(std::sync::atomic::Ordering::Relaxed)
+                        && let Some(track) = shared.track.lock().ok().and_then(|slot| slot.clone())
+                    {
+                        session = start_session(&shared, track, target_rate);
+                    }
                     if let Some(session) = session.as_mut() {
-                        let to = Duration::from_secs_f64(seconds.max(0.0));
+                        let to = Duration::from_secs_f64(seconds);
                         match session.decoder.seek(to) {
                             Ok(()) => {
                                 if let Some(resampler) = session.resampler.as_mut() {
@@ -213,6 +236,8 @@ fn decode_loop(
                                 session.pending.clear();
                                 // seek 之前缓冲里还压着最多两秒的「旧位置」音频，
                                 // 不丢掉的话，松手以后要过一会儿才听到新位置的声音。
+                                shared.clear_error();
+                                shared.seek_to(seconds);
                                 flush_and_wait(&shared);
                             }
                             Err(error) => {
@@ -230,7 +255,9 @@ fn decode_loop(
                     shared
                         .active
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    shared.flush.store(true, std::sync::atomic::Ordering::SeqCst);
+                    shared
+                        .flush
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             continue;
