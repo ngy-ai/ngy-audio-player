@@ -1,12 +1,14 @@
 //! 主视图：播放列表、正在播放、传输控制。
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -28,6 +30,11 @@ const TICK: Duration = Duration::from_millis(80);
 const FILE_DIALOG_TITLE: &str = "选择音频文件";
 /// 文件夹对话框标题。
 const FOLDER_DIALOG_TITLE: &str = "选择音乐文件夹";
+/// seek 到最右端时留的余量（秒）。解码器在末帧 seek 容易报 out-of-range，
+/// ffmpeg 从结尾开流还可能一帧都读不出来。
+const SEEK_END_MARGIN: f64 = 0.05;
+/// 刚发出的 seek 等多久还没落位就不再钉住进度条（秒）。
+const SEEK_SETTLE_TIMEOUT: Duration = Duration::from_millis(800);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepeatMode {
@@ -64,6 +71,34 @@ struct Playlist {
     tracks: Vec<Arc<TrackMeta>>,
 }
 
+/// 命名对话框要做的事：新建一个列表，还是给已有列表改名。
+#[derive(Clone, Copy)]
+enum NameTarget {
+    New,
+    Rename(u64),
+}
+
+/// 拖动列表行的载荷。`from` 是按下时的行号，落点由接收行决定。
+#[derive(Clone)]
+struct TrackDrag {
+    from: usize,
+    title: String,
+}
+
+impl Render for TrackDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().background)
+            .border_1()
+            .border_color(cx.theme().border)
+            .text_sm()
+            .child(self.title.clone())
+    }
+}
+
 pub struct PlayerView {
     player: Option<Player>,
     device_error: Option<String>,
@@ -80,6 +115,8 @@ pub struct PlayerView {
     volume: Entity<SliderState>,
     /// 用户正在拖进度条：此时不要用播放位置覆盖滑块。
     scrubbing: bool,
+    /// 刚发出的 seek 目标与时间。引擎走位之前别让进度条先弹回旧位置。
+    seek_pending: Option<(f64, Instant)>,
 
     spectrum: Spectrum,
     levels: Vec<f32>,
@@ -95,6 +132,8 @@ pub struct PlayerView {
     notice: Option<(String, Instant)>,
     /// 已经打开的原生对话框标题：连点会叠出多个窗口，重复点击只把已有窗口提到前台。
     dialog_open: Option<&'static str>,
+    /// 播放列表保存位置；`None` 表示这次运行不持久化（单元测试）。
+    library_path: Option<PathBuf>,
     focus: FocusHandle,
 }
 
@@ -116,8 +155,23 @@ impl PlayerView {
 
         // 进度条固定 0..1，用「已播比例」而不是绝对秒数：
         // 这样换歌时不用去改滑块的 max，少一处会不同步的状态。
-        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).default_value(0.0));
-        let volume = cx.new(|_| SliderState::new().min(0.0).max(1.0).default_value(0.8));
+        //
+        // step 必须远小于 1：滑动组件会把值四舍五入到 step 的整数倍。默认的 1.0
+        // 在 0..1 区间上只会得到 0 或 1 —— 拖到一半也会直接被吸到开头 / 结尾。
+        let progress = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(0.001)
+                .default_value(0.0)
+        });
+        let volume = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(0.001)
+                .default_value(0.8)
+        });
 
         // 进度条：拖动过程中只更新数字，松手才真的 seek —— 边拖边 seek 会让
         // 解码线程反复重启，反而卡顿。
@@ -130,6 +184,12 @@ impl PlayerView {
                     SliderEvent::Release(value) => (value_value(value), true),
                 };
                 let Some(ratio) = value else { return };
+                // 没有在播的曲目、或者时长还没出来时，滑块本来就该是灰的；
+                // 这里再守一道，免得叠在上面的键盘 / 无障碍操作把它拨出个假位置。
+                if !this.can_seek() {
+                    this.scrubbing = false;
+                    return;
+                }
                 let duration = this
                     .snapshot
                     .as_ref()
@@ -137,12 +197,15 @@ impl PlayerView {
                     .unwrap_or(0.0);
                 if released {
                     this.scrubbing = false;
-                    // 时长还没探测出来时没法把比例换算成秒；这时 seek 会变成跳回 0，
-                    // 听起来就是「卡一下但进度没动」。等 duration 补上再说。
-                    if duration > 0.0
-                        && let Some(player) = &this.player
-                    {
-                        player.seek((ratio as f64 * duration).max(0.0));
+                    let target = seek_target(ratio, duration);
+                    if let Some(player) = &this.player {
+                        player.seek(target);
+                    }
+                    // 解码线程处理命令要几十毫秒；这期间 tick 读到的还是旧位置，
+                    // 不钉住的话进度条会先弹回去再跳过来。
+                    this.seek_pending = Some((target, Instant::now()));
+                    if let Some(snapshot) = &mut this.snapshot {
+                        snapshot.position = target;
                     }
                 } else {
                     this.scrubbing = true;
@@ -175,7 +238,7 @@ impl PlayerView {
             WindowAppearance::Dark | WindowAppearance::VibrantDark
         );
 
-        let this = Self {
+        let mut this = Self {
             player,
             device_error,
             playlists: vec![Playlist {
@@ -191,6 +254,7 @@ impl PlayerView {
             progress,
             volume,
             scrubbing: false,
+            seek_pending: None,
             spectrum: Spectrum::new(SPECTRUM_BANDS),
             levels: vec![0.0; SPECTRUM_BANDS],
             cover: None,
@@ -201,8 +265,12 @@ impl PlayerView {
             dark,
             notice: None,
             dialog_open: None,
+            library_path: library_path(),
             focus,
         };
+
+        // 上次退出时的播放列表先回来；命令行文件随后追加到当前列表。
+        this.restore_library(cx);
 
         // 从命令行拿到的文件（`ngy-audio-player a.mp3 b.flac`）。
         let args: Vec<PathBuf> = std::env::args_os()
@@ -210,7 +278,6 @@ impl PlayerView {
             .map(PathBuf::from)
             .filter(|path| path.is_file())
             .collect();
-        let mut this = this;
         if !args.is_empty() {
             this.add_paths(args, false, window, cx);
         }
@@ -237,7 +304,17 @@ impl PlayerView {
         let Some(player) = &self.player else {
             return;
         };
-        let snapshot = player.snapshot();
+        let mut snapshot = player.snapshot();
+
+        // seek 命令发出后，引擎要不了一两百毫秒才会把新位置写回来。在这之前
+        // 位置还停在原处：照实显示会让进度条先弹回去、再跳过来，看起来像「拖了没生效」。
+        if let Some((target, at)) = self.seek_pending {
+            if (snapshot.position - target).abs() < 0.25 || at.elapsed() > SEEK_SETTLE_TIMEOUT {
+                self.seek_pending = None;
+            } else {
+                snapshot.position = target;
+            }
+        }
 
         // 标签探测在后台跑，可能比 Load 命令先完成而被引擎丢掉；时长一直为 0
         // 时补一次，别让进度条永远没有比例（拖到头会变成 seek 回 0）。
@@ -295,6 +372,14 @@ impl PlayerView {
             .position(|track| track.path == playing.path)
     }
 
+    /// 进度条能不能拖动：得真有一首曲子装进了解码器，而且知道总时长。
+    ///
+    /// 播完（`Ended`）仍算「可以拖」：引擎会把会话重新开起来，用户拖着回到中间
+    /// 是合理操作。`Idle` / `Loading` / `Failed` 时没得可 seek，直接把滑块置灰。
+    fn can_seek(&self) -> bool {
+        snapshot_can_seek(self.snapshot.as_ref())
+    }
+
     fn on_finished(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.repeat {
             // 单曲循环直接重载同一首：此时它可能已经被移出列表，不能靠下标找。
@@ -334,6 +419,7 @@ impl PlayerView {
     fn play_track(&mut self, track: Arc<TrackMeta>, window: &mut Window, cx: &mut Context<Self>) {
         self.playing = Some(track.clone());
         self.scrubbing = false;
+        self.seek_pending = None;
         if let Some(player) = &self.player {
             player.load(track.clone());
             player.set_paused(false);
@@ -364,12 +450,19 @@ impl PlayerView {
     }
 
     fn seek_by(&mut self, delta: f64, cx: &mut Context<Self>) {
+        if !self.can_seek() {
+            return;
+        }
         let Some(snapshot) = &self.snapshot else {
             return;
         };
         if let Some(player) = &self.player {
-            let target = (snapshot.position + delta).clamp(0.0, snapshot.duration.max(0.0));
+            let target = seek_target_seconds(snapshot.position + delta, snapshot.duration);
             player.seek(target);
+            self.seek_pending = Some((target, Instant::now()));
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.position = target;
+            }
             cx.notify();
         }
     }
@@ -467,8 +560,32 @@ impl PlayerView {
                 .iter()
                 .map(|path| Arc::new(TrackMeta::placeholder(path))),
         );
+        self.probe_tracks(list_id, paths.clone(), cx);
+        // 路径已经定了，标签只是展示信息：先落盘，「退出后列表还在」不依赖探测。
+        self.save_library();
 
         let added = paths.len();
+        if play_first || self.playing.is_none() {
+            self.play_index(start, window, cx);
+        } else {
+            let text = if duplicates > 0 {
+                format!("已加入 {added} 首，跳过 {duplicates} 首重复")
+            } else {
+                format!("已加入 {added} 首")
+            };
+            self.notice = Some((text, Instant::now()));
+            cx.notify();
+        }
+    }
+
+    /// 后台读标签，回来后按「列表 id + 路径」回填。
+    ///
+    /// 用 id 而不是下标：用户中途重排、删歌、切列表都不会写错位置。刚启动恢复
+    /// 播放列表时也走这条路——先把路径铺进列表，标签晚几百毫秒出现没关系。
+    fn probe_tracks(&mut self, list_id: u64, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
         let task = cx.background_executor().spawn(async move {
             paths
                 .into_iter()
@@ -478,7 +595,6 @@ impl PlayerView {
         cx.spawn(async move |this, cx| {
             let metas = task.await;
             let _ = this.update(cx, |this, cx| {
-                // 按列表 id + 路径回填：用户中途重排、删歌、切列表都不会写错位置。
                 let playing_path = this.playing.as_ref().map(|track| track.path.clone());
                 let updated = this
                     .playlists
@@ -523,18 +639,6 @@ impl PlayerView {
             });
         })
         .detach();
-
-        if play_first || self.playing.is_none() {
-            self.play_index(start, window, cx);
-        } else {
-            let text = if duplicates > 0 {
-                format!("已加入 {added} 首，跳过 {duplicates} 首重复")
-            } else {
-                format!("已加入 {added} 首")
-            };
-            self.notice = Some((text, Instant::now()));
-            cx.notify();
-        }
     }
 
     fn open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -627,6 +731,7 @@ impl PlayerView {
                 player.stop();
             }
         }
+        self.save_library();
         cx.notify();
     }
 
@@ -641,24 +746,58 @@ impl PlayerView {
         let Some(target) = index.checked_add_signed(delta) else {
             return;
         };
+        self.move_track_to(index, target, cx);
+    }
+
+    /// 把第 `from` 行搬到 `to` 的位置（拖动排序）。
+    fn move_track_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         let tracks = &mut self.playlists[self.active].tracks;
-        if target >= tracks.len() {
+        if from >= tracks.len() || to >= tracks.len() || from == to {
             return;
         }
-        tracks.swap(index, target);
+        let track = tracks.remove(from);
+        tracks.insert(to, track);
+        self.save_library();
         cx.notify();
     }
 
-    fn new_playlist(&mut self, cx: &mut Context<Self>) {
+    /// 新建一个播放列表。名字来自命名对话框，留空时退回「列表 N」。
+    fn create_playlist(&mut self, name: String, cx: &mut Context<Self>) {
         let id = self.next_playlist_id;
         self.next_playlist_id += 1;
+        let name = name.trim();
+        let name = if name.is_empty() {
+            format!("列表 {id}")
+        } else {
+            name.to_string()
+        };
         self.playlists.push(Playlist {
             id,
-            name: format!("列表 {id}"),
+            name: name.clone(),
             tracks: Vec::new(),
         });
         self.active = self.playlists.len() - 1;
-        self.notice = Some((format!("已新建「列表 {id}」"), Instant::now()));
+        self.notice = Some((format!("已新建「{name}」"), Instant::now()));
+        self.save_library();
+        cx.notify();
+    }
+
+    /// 下一个新列表的默认名字。用户不填也不会撞出一个同名列表。
+    fn default_playlist_name(&self) -> String {
+        format!("列表 {}", self.next_playlist_id)
+    }
+
+    fn rename_playlist(&mut self, id: u64, name: String, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Some(list) = self.playlists.iter_mut().find(|list| list.id == id) else {
+            return;
+        };
+        list.name = name.to_string();
+        self.notice = Some((format!("已重命名为「{name}」"), Instant::now()));
+        self.save_library();
         cx.notify();
     }
 
@@ -668,6 +807,7 @@ impl PlayerView {
         }
         self.active = index;
         self.notice = None;
+        self.save_library();
         cx.notify();
     }
 
@@ -683,7 +823,187 @@ impl PlayerView {
         } else if index < self.active {
             self.active -= 1;
         }
+        self.save_library();
         cx.notify();
+    }
+
+    /// 打开新建 / 重命名的输入对话框。
+    fn open_name_dialog(
+        &mut self,
+        target: NameTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, description, initial) = match target {
+            NameTarget::New => (
+                "新建播放列表",
+                "给新列表起个名字，之后还能改。",
+                self.default_playlist_name(),
+            ),
+            NameTarget::Rename(id) => {
+                let Some(list) = self.playlists.iter().find(|list| list.id == id) else {
+                    return;
+                };
+                ("重命名播放列表", "列表里的曲目不会变。", list.name.clone())
+            }
+        };
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(initial)
+                .placeholder("列表名称")
+        });
+        // 这个 builder 可能被重复调用；聚焦只做一次，否则会把焦点从输入框抢走。
+        let focused = Cell::new(false);
+        let view = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            if !focused.replace(true) {
+                input.update(cx, |state, cx| {
+                    // 预填的是「列表 3」这种默认名，全选后直接输入就能替换。
+                    state.select_all(window, cx);
+                    state.focus_handle(cx).focus(window, cx);
+                });
+            }
+            alert
+                .confirm()
+                .title(title)
+                .description(description)
+                .ok_text("保存")
+                .cancel_text("取消")
+                .child(Input::new(&input))
+                .on_ok({
+                    let input = input.clone();
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        let name = input.read(cx).value().trim().to_string();
+                        let Some(view) = view.upgrade() else {
+                            return true;
+                        };
+                        if name.is_empty() {
+                            view.update(cx, |this, cx| {
+                                this.notice = Some(("列表名称不能为空".into(), Instant::now()));
+                                cx.notify();
+                            });
+                            // 返回 false：对话框不关，用户可以接着改。
+                            return false;
+                        }
+                        view.update(cx, |this, cx| this.apply_name(target, name, cx));
+                        true
+                    }
+                })
+        });
+    }
+
+    fn apply_name(&mut self, target: NameTarget, name: String, cx: &mut Context<Self>) {
+        match target {
+            NameTarget::New => self.create_playlist(name, cx),
+            NameTarget::Rename(id) => self.rename_playlist(id, name, cx),
+        }
+    }
+
+    /// 删列表不可逆，先问一句。真正删除在确认按钮的回调里。
+    fn confirm_remove_playlist(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.playlists.len() <= 1 {
+            return;
+        }
+        let Some(playlist) = self.playlists.get(index) else {
+            return;
+        };
+        let id = playlist.id;
+        let name = playlist.name.clone();
+        let count = playlist.tracks.len();
+        let view = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .confirm()
+                .title("删除播放列表")
+                .description(format!(
+                    "确定删除「{name}」吗？列表里的 {count} 首曲目只会从列表移除，磁盘上的文件不会被删除。"
+                ))
+                .ok_text("删除")
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text("取消")
+                .on_ok({
+                    let view = view.clone();
+                    // 确认之前列表可能已经变了，按 id 找回真正要删的那一张。
+                    move |_, _, cx| {
+                        if let Some(view) = view.upgrade() {
+                            view.update(cx, |this, cx| {
+                                if let Some(index) =
+                                    this.playlists.iter().position(|list| list.id == id)
+                                {
+                                    this.remove_playlist(index, cx);
+                                }
+                            });
+                        }
+                        true
+                    }
+                })
+        });
+    }
+
+    /// 把播放列表写成文本；失败只记日志，不该影响播放。
+    fn save_library(&self) {
+        let Some(path) = &self.library_path else {
+            return;
+        };
+        if let Err(error) = write_library(path, &self.playlists, self.active) {
+            eprintln!("[library] 保存播放列表失败: {error}");
+        }
+    }
+
+    /// 读回上次的播放列表。标签在后台补，先把路径铺上去。
+    fn restore_library(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = &self.library_path else {
+            return;
+        };
+        let Some(saved) = read_library(path) else {
+            return;
+        };
+        if saved.playlists.is_empty() {
+            return;
+        }
+
+        self.playlists = saved
+            .playlists
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, paths))| Playlist {
+                id: index as u64 + 1,
+                name,
+                tracks: paths
+                    .iter()
+                    .map(|path| Arc::new(TrackMeta::placeholder(path)))
+                    .collect(),
+            })
+            .collect();
+        self.next_playlist_id = self.playlists.len() as u64 + 1;
+        self.active = saved.active.min(self.playlists.len() - 1);
+
+        let probes: Vec<(u64, Vec<PathBuf>)> = self
+            .playlists
+            .iter()
+            .map(|playlist| {
+                (
+                    playlist.id,
+                    playlist
+                        .tracks
+                        .iter()
+                        .map(|track| track.path.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        for (list_id, paths) in probes {
+            self.probe_tracks(list_id, paths, cx);
+        }
     }
 }
 
@@ -697,6 +1017,171 @@ fn path_key(path: &Path) -> String {
     } else {
         key
     }
+}
+
+// —— 播放列表持久化 ——
+//
+// 只存「列表名 + 文件路径」：标题、时长、封面都能从文件重新读出来，存下来反而
+// 会在换机器 / 改标签之后变成假信息。格式是带转义的制表符文本，够简单、出问题
+// 时还能用文本编辑器看一眼。
+
+/// 磁盘上的一份播放列表。
+struct SavedLibrary {
+    active: usize,
+    playlists: Vec<(String, Vec<PathBuf>)>,
+}
+
+/// 配置文件位置。单元测试里返回 `None`：测试不该读写用户真实的配置目录。
+fn library_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    Some(config_dir()?.join("ngy-audio-player").join("library.txt"))
+}
+
+fn config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }
+}
+
+/// 制表符是字段分隔符；名字和路径里可能真有换行，转义掉才不会被解析成两行。
+fn escape_field(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn unescape_field(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn serialize_library(playlists: &[Playlist], active: usize) -> String {
+    let mut text = String::from("# 声波播放列表（自动生成，手动改需要保持这个格式）\nversion 1\n");
+    text.push_str(&format!("active {active}\n"));
+    for playlist in playlists {
+        text.push_str("list\t");
+        text.push_str(&escape_field(&playlist.name));
+        text.push('\n');
+        for track in &playlist.tracks {
+            text.push_str("track\t");
+            text.push_str(&escape_field(&track.path.to_string_lossy()));
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn parse_library(text: &str) -> Option<SavedLibrary> {
+    let mut active = 0usize;
+    let mut playlists: Vec<(String, Vec<PathBuf>)> = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') || line.starts_with("version ") {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("active ") {
+            active = value.trim().parse().unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("list\t") {
+            playlists.push((unescape_field(value), Vec::new()));
+        } else if let Some(value) = line.strip_prefix("track\t") {
+            if value.is_empty() {
+                continue;
+            }
+            if let Some((_, tracks)) = playlists.last_mut() {
+                tracks.push(PathBuf::from(unescape_field(value)));
+            }
+        }
+    }
+
+    if playlists.is_empty() {
+        return None;
+    }
+    let active = active.min(playlists.len() - 1);
+    Some(SavedLibrary { active, playlists })
+}
+
+fn read_library(path: &Path) -> Option<SavedLibrary> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_library(&text)
+}
+
+fn write_library(path: &Path, playlists: &[Playlist], active: usize) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 列表就几 KB，直接写比「临时文件 + rename」更省事；崩溃最多丢掉最后一次改动。
+    std::fs::write(path, serialize_library(playlists, active))
+}
+
+/// 目标是否落在「有曲目、能 seek」的状态里。
+fn snapshot_can_seek(snapshot: Option<&Snapshot>) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot.duration > 0.0
+            && matches!(
+                snapshot.state,
+                PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Ended
+            )
+    })
+}
+
+/// 按 0..1 的比例算 seek 目标（秒）。
+fn seek_target(ratio: f32, duration: f64) -> f64 {
+    seek_target_seconds(ratio as f64 * duration, duration)
+}
+
+/// 把秒数夹进文件真正能落到的范围：末尾 50ms 留给解码器的末帧保护。
+fn seek_target_seconds(target: f64, duration: f64) -> f64 {
+    if !target.is_finite() {
+        return 0.0;
+    }
+    let upper = (duration - SEEK_END_MARGIN).max(0.0);
+    target.clamp(0.0, upper)
 }
 
 /// 从 SliderValue 里取单值。
@@ -849,6 +1334,8 @@ impl Render for PlayerView {
         } else {
             IconName::Play
         };
+        // 没有装进解码器的曲目时进度条置灰：拖它只会得到一个没有意义的位置。
+        let can_seek = snapshot_can_seek(snapshot.as_ref());
 
         let notice = self
             .notice
@@ -1031,7 +1518,7 @@ impl Render for PlayerView {
         }
 
         // —— 主体：列表 + 正在播放 ——
-        // 播放列表标签栏：点标签切换，标签上的 × 删掉整个列表（最后一个不给删）。
+        // 播放列表标签栏：点标签切换；铅笔改名；× 删掉整个列表（先确认，最后一个不给删）。
         let mut playlist_bar = h_flex()
             .flex_none()
             .px_2()
@@ -1042,9 +1529,28 @@ impl Render for PlayerView {
             .border_b_1()
             .border_color(border);
 
+        // 标签上的小图标：点击区比图标大一圈，顺手拦住冒泡，别触发切列表。
+        let tab_action = |id: String, icon: IconName, danger: bool| {
+            div()
+                .id(id)
+                .test_support()
+                .flex()
+                .items_center()
+                .justify_center()
+                // 图标本身只有 12px，把点击区撑到 16px 才好点。
+                .size(px(16.0))
+                .rounded_full()
+                .cursor_pointer()
+                .opacity(0.45)
+                .hover(|this| this.opacity(1.0))
+                .when(danger, |this| this.text_color(danger_color))
+                .child(Icon::new(icon).size(px(12.0)))
+        };
+
         for (index, playlist) in self.playlists.iter().enumerate() {
             let selected = index == self.active;
             let removable = self.playlists.len() > 1;
+            let editable = playlist.id;
             playlist_bar = playlist_bar.child(
                 h_flex()
                     .id(format!("playlist-tab:{index}"))
@@ -1064,30 +1570,33 @@ impl Render for PlayerView {
                     .on_click(cx.listener(move |this, _, _, cx| this.switch_playlist(index, cx)))
                     .child(
                         div()
+                            .id(format!("playlist-name:{index}"))
+                            .test_support()
                             .max_w(px(110.0))
                             .truncate()
                             .child(playlist.name.clone()),
                     )
+                    .child(
+                        tab_action(
+                            format!("playlist-rename:{index}"),
+                            IconName::PencilLine,
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_name_dialog(NameTarget::Rename(editable), window, cx);
+                            },
+                        )),
+                    )
                     .when(removable, |this| {
                         this.child(
-                            div()
-                                .id(format!("playlist-remove:{index}"))
-                                .test_support()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                // 图标本身只有 12px，把点击区撑到 16px 才好点。
-                                .size(px(16.0))
-                                .rounded_full()
-                                .cursor_pointer()
-                                .opacity(0.45)
-                                .hover(|this| this.opacity(1.0))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    // 不拦下来的话，点 × 会先把这个列表切到前台再删。
+                            tab_action(format!("playlist-remove:{index}"), IconName::X, true)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    // 不拦下来的话，点 × 会先把这个列表切到前台再弹确认。
                                     cx.stop_propagation();
-                                    this.remove_playlist(index, cx);
-                                }))
-                                .child(Icon::new(IconName::X).size(px(12.0))),
+                                    this.confirm_remove_playlist(index, window, cx);
+                                })),
                         )
                     }),
             );
@@ -1104,7 +1613,9 @@ impl Render for PlayerView {
                         .icon(IconName::Plus)
                         .tooltip("新建播放列表"),
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.new_playlist(cx))),
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_name_dialog(NameTarget::New, window, cx)
+                })),
         );
 
         let tracks = self.active_tracks();
@@ -1175,6 +1686,23 @@ impl Render for PlayerView {
                             .border_color(primary)
                     })
                     .hover(|this| this.bg(muted))
+                    // 整行可拖：按住任何位置拖动都能换顺序，松手时由落点行接手。
+                    .on_drag(
+                        TrackDrag {
+                            from: index,
+                            title: track.title.clone(),
+                        },
+                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+                    )
+                    .drag_over::<TrackDrag>(move |style, _, _, _| {
+                        style
+                            .bg(primary.opacity(0.10))
+                            .border_1()
+                            .border_color(primary)
+                    })
+                    .on_drop(cx.listener(move |this, drag: &TrackDrag, _, cx| {
+                        this.move_track_to(drag.from, index, cx);
+                    }))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.play_index(index, window, cx);
                     }))
@@ -1224,6 +1752,18 @@ impl Render for PlayerView {
                             .text_xs()
                             .text_color(muted_foreground)
                             .child(duration_text),
+                    )
+                    .child(
+                        // 拖拽手柄只是个提示：真正可拖的是整行。
+                        div()
+                            .flex_none()
+                            .opacity(0.35)
+                            .group_hover(row_group.clone(), |this| this.opacity(0.8))
+                            .child(
+                                Icon::new(IconName::GripVertical)
+                                    .size(px(14.0))
+                                    .text_color(muted_foreground),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -1430,9 +1970,12 @@ impl Render for PlayerView {
                                 .child(format_time(position)),
                         )
                         .child(
-                            div()
-                                .flex_1()
-                                .child(Slider::new(&self.progress).horizontal()),
+                            div().flex_1().child(
+                                Slider::new(&self.progress)
+                                    .horizontal()
+                                    // 没在播东西时滑块是灰的：点它不该产生任何位置变化。
+                                    .disabled(!can_seek),
+                            ),
                         )
                         .child(
                             div()
@@ -1498,6 +2041,7 @@ mod tests {
     use std::rc::Rc;
 
     use gpui_kit::TestAppContext;
+    use gpui_kit::component::dialog::{Cancel, Confirm};
     use gpui_kit::test::TestWindowExt as _;
 
     /// 窗口的根必须自己实现 Render，`Entity<T>` 不算；所以套一层壳。
@@ -1726,6 +2270,202 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn dropping_a_track_lands_at_the_drop_index(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let _window = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        // 用占位曲目就够：排序只看路径 / 标题，不读文件。
+        let titles = cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.playlists[0].tracks = ["a", "b", "c", "d"]
+                    .iter()
+                    .map(|name| Arc::new(TrackMeta::placeholder(Path::new(&format!("{name}.mp3")))))
+                    .collect();
+                cx.notify();
+                view.playlists[0]
+                    .tracks
+                    .iter()
+                    .map(|track| track.title.clone())
+                    .collect::<Vec<_>>()
+            })
+        });
+        assert_eq!(titles, vec!["a", "b", "c", "d"]);
+
+        // 往下拖：c 落到第一行，其余保持相对顺序。
+        cx.update(|app| view.update(app, |view, cx| view.move_track_to(2, 0, cx)));
+        let titles = cx.update(|app| {
+            view.read(app).playlists[0]
+                .tracks
+                .iter()
+                .map(|track| track.title.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(titles, vec!["c", "a", "b", "d"]);
+
+        // 往上拖：再把 c 放到末尾。
+        cx.update(|app| view.update(app, |view, cx| view.move_track_to(0, 3, cx)));
+        let titles = cx.update(|app| {
+            view.read(app).playlists[0]
+                .tracks
+                .iter()
+                .map(|track| track.title.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(titles, vec!["a", "b", "d", "c"]);
+
+        // 越界的落点不动列表。
+        cx.update(|app| view.update(app, |view, cx| view.move_track_to(0, 99, cx)));
+        let titles = cx.update(|app| {
+            view.read(app).playlists[0]
+                .tracks
+                .iter()
+                .map(|track| track.title.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(titles, vec!["a", "b", "d", "c"]);
+    }
+
+    #[test]
+    fn progress_is_only_seekable_while_something_is_loaded() {
+        let snapshot = |state, duration| Snapshot {
+            state,
+            position: 0.0,
+            duration,
+            volume: 1.0,
+            backend: None,
+            error: None,
+            track: None,
+            finished_serial: 0,
+            device: String::new(),
+        };
+
+        assert!(!snapshot_can_seek(None), "还没装载曲目时不能拖进度");
+        assert!(!snapshot_can_seek(Some(&snapshot(
+            PlaybackState::Idle,
+            10.0
+        ))));
+        assert!(!snapshot_can_seek(Some(&snapshot(
+            PlaybackState::Loading,
+            10.0
+        ))));
+        assert!(!snapshot_can_seek(Some(&snapshot(
+            PlaybackState::Failed,
+            10.0
+        ))));
+        assert!(
+            !snapshot_can_seek(Some(&snapshot(PlaybackState::Playing, 0.0))),
+            "时长未知时换算不出秒数，也不该让拖"
+        );
+
+        assert!(snapshot_can_seek(Some(&snapshot(
+            PlaybackState::Playing,
+            10.0
+        ))));
+        assert!(snapshot_can_seek(Some(&snapshot(
+            PlaybackState::Paused,
+            10.0
+        ))));
+        assert!(
+            snapshot_can_seek(Some(&snapshot(PlaybackState::Ended, 10.0))),
+            "播完之后还能拖回去重听"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn playlists_are_restored_from_disk(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let dir =
+            std::env::temp_dir().join(format!("ngy-audio-player-library-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("library.txt");
+
+        // 造一份「上次退出时」的列表，然后从一个全新的视图里恢复。
+        let playlists = vec![
+            Playlist {
+                id: 1,
+                name: "通勤".into(),
+                tracks: vec![Arc::new(TrackMeta::placeholder(Path::new("a.mp3")))],
+            },
+            Playlist {
+                id: 2,
+                name: "夜里".into(),
+                tracks: vec![
+                    Arc::new(TrackMeta::placeholder(Path::new("b.flac"))),
+                    Arc::new(TrackMeta::placeholder(Path::new("c.wav"))),
+                ],
+            },
+        ];
+        write_library(&path, &playlists, 1).expect("应当能写进临时目录");
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let _window = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+        let view = slot.borrow().clone().expect("视图没有建出来");
+
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                // 生产路径由配置目录决定；测试里显式指到临时文件。
+                view.library_path = Some(path.clone());
+                view.restore_library(cx);
+            });
+        });
+
+        let (active, lists, second_list) = cx.update(|app| {
+            let view = view.read(app);
+            (
+                view.active,
+                view.playlists
+                    .iter()
+                    .map(|list| (list.name.clone(), list.tracks.len()))
+                    .collect::<Vec<_>>(),
+                view.playlists[1]
+                    .tracks
+                    .iter()
+                    .map(|track| track.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(active, 1, "上次选中的列表要回来");
+        assert_eq!(
+            lists,
+            vec![("通勤".to_string(), 1), ("夜里".to_string(), 2)]
+        );
+        assert_eq!(
+            second_list,
+            vec![PathBuf::from("b.flac"), PathBuf::from("c.wav")]
+        );
+
+        // 恢复之后继续改动，要写回同一个文件。
+        cx.update(|app| {
+            view.update(app, |view, cx| {
+                view.rename_playlist(1, "上班路上".into(), cx)
+            });
+        });
+        let saved = read_library(&path).expect("改完名字文件应当还在");
+        assert_eq!(saved.playlists[0].0, "上班路上");
+        assert_eq!(saved.active, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
     fn playlists_hold_their_own_tracks(cx: &mut TestAppContext) {
         let paths = samples();
         if paths.len() < 3 {
@@ -1744,7 +2484,7 @@ mod tests {
                 let view = cx.new(|cx| PlayerView::new(window, cx));
                 view.update(cx, |view, cx| {
                     view.add_paths(first_two, false, window, cx);
-                    view.new_playlist(cx);
+                    view.create_playlist("列表 2".into(), cx);
                     view.add_paths(vec![third], false, window, cx);
                 });
                 *slot.borrow_mut() = Some(view.clone());
@@ -1882,32 +2622,228 @@ mod tests {
 
         let view = slot.borrow().clone().expect("视图没有建出来");
 
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("new-playlist", cx);
-        })
-        .unwrap();
+        // 建列表本身要经过命名对话框（弹框流程见下面的 Root 测试），这里直接造数据。
+        cx.update(|app| view.update(app, |view, cx| view.create_playlist("我的精选".into(), cx)));
         assert_eq!(cx.update(|app| view.read(app).playlists.len()), 2);
         assert_eq!(
             cx.update(|app| view.read(app).active),
             1,
             "新建之后应当切到新列表"
         );
+        assert_eq!(
+            cx.update(|app| view.read(app).playlists[1].name.clone()),
+            "我的精选",
+            "列表该用用户输入的名字"
+        );
 
+        // 点名字区域切换，而不是点整个标签（标签中间现在可能落在铅笔图标上）。
         cx.update_window(handle.into(), |_, window, cx| {
-            window.click("playlist-tab:0", cx);
+            window.click("playlist-name:0", cx);
         })
         .unwrap();
         assert_eq!(cx.update(|app| view.read(app).active), 0);
 
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("playlist-remove:0", cx);
-        })
-        .unwrap();
+        cx.update(|app| view.update(app, |view, cx| view.remove_playlist(0, cx)));
         let left = cx.update(|app| {
             let view = view.read(app);
             (view.playlists.len(), view.playlists[0].name.clone())
         });
         assert_eq!(left.0, 1);
-        assert_eq!(left.1, "列表 2", "删掉列表 1 之后列表 2 应当还在");
+        assert_eq!(left.1, "我的精选", "删掉列表 1 之后列表 2 应当还在");
+    }
+
+    /// 带 Root 的窗口：对话框挂在 Root 上，只有这种窗口里才能点开确认框。
+    fn root_window(
+        cx: &mut TestAppContext,
+        slot: Rc<RefCell<Option<Entity<PlayerView>>>>,
+    ) -> gpui_kit::WindowHandle<Root> {
+        cx.add_window(move |window, cx| {
+            let view = cx.new(|cx| PlayerView::new(window, cx));
+            *slot.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        })
+    }
+
+    #[gpui_kit::test]
+    fn creating_a_playlist_asks_for_a_name(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = root_window(cx, slot.clone());
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        assert_eq!(cx.update(|app| view.read(app).playlists.len()), 1);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("new-playlist", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        assert!(
+            cx.update_window(handle.into(), |_, window, cx| window.has_active_dialog(cx))
+                .unwrap(),
+            "新建列表应当先弹命名对话框"
+        );
+        assert_eq!(
+            cx.update(|app| view.read(app).playlists.len()),
+            1,
+            "没确认之前不该真的建列表"
+        );
+
+        // 默认名已经填进输入框；直接确认就应该得到「列表 2」。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let names = cx.update(|app| {
+            view.read(app)
+                .playlists
+                .iter()
+                .map(|playlist| playlist.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            names,
+            vec!["列表 1".to_string(), "列表 2".to_string()],
+            "确认后应当按输入框里的名字新建列表"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn deleting_a_playlist_asks_for_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = root_window(cx, slot.clone());
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        let names = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        let view_for_setup = view.clone();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view_for_setup.update(cx, |view, cx| {
+                view.create_playlist("第二张".into(), cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        *names.borrow_mut() = cx.update(|app| {
+            view.read(app)
+                .playlists
+                .iter()
+                .map(|playlist| playlist.name.clone())
+                .collect()
+        });
+        assert_eq!(names.borrow().len(), 2);
+
+        // 点 ×：先出确认框，列表还在。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("playlist-remove:0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(
+            cx.update_window(handle.into(), |_, window, cx| window.has_active_dialog(cx))
+                .unwrap(),
+            "删除播放列表应当先确认"
+        );
+        assert_eq!(
+            cx.update(|app| view.read(app).playlists.len()),
+            2,
+            "确认之前列表不能被删掉"
+        );
+
+        // 取消：列表原样保留。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_action(Box::new(Cancel), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(cx.update(|app| view.read(app).playlists.len()), 2);
+
+        // 再来一次并确认：只删掉被点的那一张。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("playlist-remove:0", cx);
+            window.render_frame(cx);
+            window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let left = cx.update(|app| {
+            view.read(app)
+                .playlists
+                .iter()
+                .map(|playlist| playlist.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(left, vec!["第二张".to_string()], "只该删掉被点的那一张");
+    }
+
+    #[test]
+    fn library_text_round_trips_names_and_paths() {
+        let playlist = |name: &str, paths: &[&str]| Playlist {
+            id: 1,
+            name: name.into(),
+            tracks: paths
+                .iter()
+                .map(|path| Arc::new(TrackMeta::placeholder(Path::new(path))))
+                .collect(),
+        };
+
+        // 名字里带制表符 / 换行 / 反斜杠，路径里带 Windows 盘符：都是真实会遇到的。
+        let playlists = vec![
+            playlist("夜里的\t歌\n单", &[r"C:\音乐\一 - 二.flac", "/tmp/三.mp3"]),
+            playlist("空列表", &[]),
+        ];
+        let text = serialize_library(&playlists, 1);
+        let saved = parse_library(&text).expect("应当能解回来");
+
+        assert_eq!(saved.active, 1);
+        assert_eq!(saved.playlists.len(), 2);
+        assert_eq!(saved.playlists[0].0, "夜里的\t歌\n单");
+        assert_eq!(
+            saved.playlists[0].1,
+            vec![
+                PathBuf::from(r"C:\音乐\一 - 二.flac"),
+                PathBuf::from("/tmp/三.mp3")
+            ]
+        );
+        assert_eq!(saved.playlists[1].0, "空列表");
+        assert!(saved.playlists[1].1.is_empty());
+    }
+
+    #[test]
+    fn library_active_index_is_clamped() {
+        let playlist = |name: &str| Playlist {
+            id: 1,
+            name: name.into(),
+            tracks: Vec::new(),
+        };
+        let text = serialize_library(&[playlist("A"), playlist("B")], 9);
+        assert_eq!(
+            parse_library(&text).unwrap().active,
+            1,
+            "越界的 active 要收回来"
+        );
+        assert!(parse_library("").is_none(), "空文件不算一份列表");
+        assert!(parse_library("version 1\nactive 0\n").is_none());
+    }
+
+    #[test]
+    fn seek_target_stays_off_the_last_frames() {
+        assert!((seek_target(1.0, 10.0) - 9.95).abs() < 1e-9);
+        assert_eq!(seek_target(0.0, 10.0), 0.0);
+        assert_eq!(seek_target(0.5, 10.0), 5.0);
+        assert_eq!(seek_target(1.0, 0.0), 0.0);
+        assert_eq!(seek_target_seconds(-3.0, 10.0), 0.0);
     }
 }
