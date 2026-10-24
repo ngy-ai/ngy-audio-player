@@ -25,6 +25,8 @@ const SPECTRUM_HEIGHT: f32 = 96.0;
 const TICK: Duration = Duration::from_millis(80);
 /// 文件对话框标题。重复点击时靠它找回已经打开的窗口。
 const FILE_DIALOG_TITLE: &str = "选择音频文件";
+/// 文件夹对话框标题。
+const FOLDER_DIALOG_TITLE: &str = "选择音乐文件夹";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepeatMode {
@@ -76,8 +78,8 @@ pub struct PlayerView {
     dark: bool,
     /// 一次性提示（例如「这个格式需要 ffmpeg」），过几秒自动消失。
     notice: Option<(String, Instant)>,
-    /// 文件选择框已经打开：连点会叠出多个窗口，重复点击只把已有窗口提到前台。
-    file_dialog_open: bool,
+    /// 已经打开的原生对话框标题：连点会叠出多个窗口，重复点击只把已有窗口提到前台。
+    dialog_open: Option<&'static str>,
     focus: FocusHandle,
 }
 
@@ -168,7 +170,7 @@ impl PlayerView {
             has_ffmpeg: ngy_audio_engine::has_ffmpeg(),
             dark,
             notice: None,
-            file_dialog_open: false,
+            dialog_open: None,
             focus,
         };
 
@@ -399,24 +401,25 @@ impl PlayerView {
     }
 
     fn open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.file_dialog_open {
-            focus_file_dialog();
+        if let Some(title) = self.dialog_open {
+            focus_dialog(title);
             return;
         }
-        self.file_dialog_open = true;
+        self.dialog_open = Some(FILE_DIALOG_TITLE);
         let extensions = format::dialog_extensions();
-        let task = cx.background_executor().spawn(async move {
-            rfd::FileDialog::new()
-                .add_filter("音频文件", extensions)
-                .add_filter("所有文件", &["*"])
-                .set_title(FILE_DIALOG_TITLE)
-                .pick_files()
-                .unwrap_or_default()
-        });
+        let dialog = rfd::FileDialog::new()
+            .add_filter("音频文件", extensions)
+            .add_filter("所有文件", &["*"])
+            .set_title(FILE_DIALOG_TITLE)
+            // 指定父窗口后才是真模态：打开期间主窗口不可操作，选择框也始终跟着主窗口。
+            .set_parent(window);
+        let task = cx
+            .background_executor()
+            .spawn(async move { dialog.pick_files().unwrap_or_default() });
         cx.spawn_in(window, async move |this, cx| {
             let files = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.file_dialog_open = false;
+                this.dialog_open = None;
                 if files.is_empty() {
                     return;
                 }
@@ -427,19 +430,29 @@ impl PlayerView {
     }
 
     fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(title) = self.dialog_open {
+            focus_dialog(title);
+            return;
+        }
+        self.dialog_open = Some(FOLDER_DIALOG_TITLE);
+        let dialog = rfd::FileDialog::new()
+            .set_title(FOLDER_DIALOG_TITLE)
+            .set_parent(window);
         let task = cx.background_executor().spawn(async move {
-            let Some(folder) = rfd::FileDialog::new().set_title("选择音乐文件夹").pick_folder()
-            else {
+            let Some(folder) = dialog.pick_folder() else {
                 return Vec::new();
             };
             scan_folder(&folder)
         });
         cx.spawn_in(window, async move |this, cx| {
             let files = task.await;
-            if files.is_empty() {
-                return;
-            }
-            let _ = this.update_in(cx, |this, window, cx| this.add_paths(files, false, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.dialog_open = None;
+                if files.is_empty() {
+                    return;
+                }
+                this.add_paths(files, false, window, cx);
+            });
         })
         .detach();
     }
@@ -479,17 +492,14 @@ fn value_value(value: &SliderValue) -> Option<f32> {
     }
 }
 
-/// 把已经打开的原生文件对话框提到前台。
+/// 把已经打开的原生选择框提到前台。
 #[cfg(windows)]
-fn focus_file_dialog() {
+fn focus_dialog(title: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowW, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow,
     };
 
-    let title: Vec<u16> = FILE_DIALOG_TITLE
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: 标题是以 NUL 结尾的 UTF-16 字符串；句柄只传给 user32 做窗口激活。
     let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
     if hwnd.is_null() {
@@ -504,7 +514,7 @@ fn focus_file_dialog() {
 }
 
 #[cfg(not(windows))]
-fn focus_file_dialog() {}
+fn focus_dialog(_title: &str) {}
 
 fn scan_folder(folder: &std::path::Path) -> Vec<PathBuf> {
     // 只扫两层：音乐库通常就是「专辑/曲目」两层，再深多半是在扫游戏资源目录。
