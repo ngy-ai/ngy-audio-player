@@ -1,6 +1,7 @@
 //! 主视图：播放列表、正在播放、传输控制。
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,7 @@ use ngy_audio_engine::{PlaybackState, Player, Snapshot};
 use super::cover;
 use super::spectrum::Spectrum;
 
-const SIDEBAR_WIDTH: f32 = 320.0;
+const SIDEBAR_WIDTH: f32 = 340.0;
 const SPECTRUM_BANDS: usize = 44;
 const SPECTRUM_HEIGHT: f32 = 96.0;
 /// 定时刷新间隔。频谱要跳得顺，但也没必要每帧算 FFT。
@@ -53,12 +54,26 @@ impl RepeatMode {
     }
 }
 
+/// 一个播放列表。
+///
+/// `id` 只做内部标识：异步探测标签回来时要靠它找回「当初加入的那个列表」，
+/// 用户中途切换 / 删除列表时不会把标签写到别的列表里。
+struct Playlist {
+    id: u64,
+    name: String,
+    tracks: Vec<Arc<TrackMeta>>,
+}
+
 pub struct PlayerView {
     player: Option<Player>,
     device_error: Option<String>,
 
-    tracks: Vec<Arc<TrackMeta>>,
-    current: Option<usize>,
+    playlists: Vec<Playlist>,
+    /// 当前显示的列表下标，始终指向 `playlists` 里的有效项。
+    active: usize,
+    /// 正在播放的曲目。用路径而不是下标记录：重排 / 删除曲目后依然指得准。
+    playing: Option<Arc<TrackMeta>>,
+    next_playlist_id: u64,
     snapshot: Option<Snapshot>,
 
     progress: Entity<SliderState>,
@@ -106,31 +121,39 @@ impl PlayerView {
 
         // 进度条：拖动过程中只更新数字，松手才真的 seek —— 边拖边 seek 会让
         // 解码线程反复重启，反而卡顿。
-        cx.subscribe_in(&progress, window, |this, _, event: &SliderEvent, window, cx| {
-            let (value, released) = match event {
-                SliderEvent::Change(value) => (value_value(value), false),
-                SliderEvent::Release(value) => (value_value(value), true),
-            };
-            let Some(ratio) = value else { return };
-            let duration = this
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.duration)
-                .unwrap_or(0.0);
-            if released {
-                this.scrubbing = false;
-                if let Some(player) = &this.player {
-                    player.seek((ratio as f64 * duration).max(0.0));
+        cx.subscribe_in(
+            &progress,
+            window,
+            |this, _, event: &SliderEvent, window, cx| {
+                let (value, released) = match event {
+                    SliderEvent::Change(value) => (value_value(value), false),
+                    SliderEvent::Release(value) => (value_value(value), true),
+                };
+                let Some(ratio) = value else { return };
+                let duration = this
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.duration)
+                    .unwrap_or(0.0);
+                if released {
+                    this.scrubbing = false;
+                    // 时长还没探测出来时没法把比例换算成秒；这时 seek 会变成跳回 0，
+                    // 听起来就是「卡一下但进度没动」。等 duration 补上再说。
+                    if duration > 0.0
+                        && let Some(player) = &this.player
+                    {
+                        player.seek((ratio as f64 * duration).max(0.0));
+                    }
+                } else {
+                    this.scrubbing = true;
+                    if let Some(snapshot) = &mut this.snapshot {
+                        snapshot.position = ratio as f64 * duration;
+                    }
                 }
-            } else {
-                this.scrubbing = true;
-                if let Some(snapshot) = &mut this.snapshot {
-                    snapshot.position = ratio as f64 * duration;
-                }
-            }
-            let _ = window;
-            cx.notify();
-        })
+                let _ = window;
+                cx.notify();
+            },
+        )
         .detach();
 
         cx.subscribe_in(&volume, window, |this, _, event: &SliderEvent, _, cx| {
@@ -155,8 +178,15 @@ impl PlayerView {
         let this = Self {
             player,
             device_error,
-            tracks: Vec::new(),
-            current: None,
+            playlists: vec![Playlist {
+                id: 1,
+                name: "列表 1".into(),
+                tracks: Vec::new(),
+            }],
+            active: 0,
+            playing: None,
+            // 编号只增不减：删掉「列表 2」再新建，不会冒出一个同名的列表。
+            next_playlist_id: 2,
             snapshot: None,
             progress,
             volume,
@@ -209,6 +239,17 @@ impl PlayerView {
         };
         let snapshot = player.snapshot();
 
+        // 标签探测在后台跑，可能比 Load 命令先完成而被引擎丢掉；时长一直为 0
+        // 时补一次，别让进度条永远没有比例（拖到头会变成 seek 回 0）。
+        if snapshot.duration <= 0.0
+            && let Some(track) = self
+                .current_index()
+                .and_then(|index| self.active_tracks().get(index))
+            && track.duration.is_some()
+        {
+            player.refresh_metadata(track.clone());
+        }
+
         // 频谱：有声音才算，静音时让柱子自己落下去。
         let samples = player.spectrum();
         if samples.is_empty() {
@@ -239,33 +280,59 @@ impl PlayerView {
         cx.notify();
     }
 
+    fn active_tracks(&self) -> &[Arc<TrackMeta>] {
+        self.playlists
+            .get(self.active)
+            .map(|playlist| playlist.tracks.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 正在播放的曲目在当前列表里的位置。不在当前列表（例如刚切到别的列表）就是 `None`。
+    fn current_index(&self) -> Option<usize> {
+        let playing = self.playing.as_ref()?;
+        self.active_tracks()
+            .iter()
+            .position(|track| track.path == playing.path)
+    }
+
     fn on_finished(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.repeat {
+            // 单曲循环直接重载同一首：此时它可能已经被移出列表，不能靠下标找。
             RepeatMode::One => {
-                if let Some(index) = self.current {
-                    self.play_index(index, window, cx);
+                if let Some(track) = self.playing.clone() {
+                    self.play_track(track, window, cx);
                 }
             }
             RepeatMode::All => {
-                if !self.tracks.is_empty() {
-                    let next = self.current.map(|index| (index + 1) % self.tracks.len()).unwrap_or(0);
+                let count = self.active_tracks().len();
+                if count > 0 {
+                    let next = self
+                        .current_index()
+                        .map(|index| (index + 1) % count)
+                        .unwrap_or(0);
                     self.play_index(next, window, cx);
                 }
             }
             RepeatMode::Off => {
-                let Some(current) = self.current else { return };
-                if current + 1 < self.tracks.len() {
-                    self.play_index(current + 1, window, cx);
+                let Some(index) = self.current_index() else {
+                    return;
+                };
+                if index + 1 < self.active_tracks().len() {
+                    self.play_index(index + 1, window, cx);
                 }
             }
         }
     }
 
     fn play_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(track) = self.tracks.get(index).cloned() else {
+        let Some(track) = self.active_tracks().get(index).cloned() else {
             return;
         };
-        self.current = Some(index);
+        self.play_track(track, window, cx);
+    }
+
+    fn play_track(&mut self, track: Arc<TrackMeta>, window: &mut Window, cx: &mut Context<Self>) {
+        self.playing = Some(track.clone());
         self.scrubbing = false;
         if let Some(player) = &self.player {
             player.load(track.clone());
@@ -280,12 +347,12 @@ impl PlayerView {
     }
 
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tracks.is_empty() {
+        let count = self.active_tracks().len();
+        if count == 0 {
             return;
         }
-        let current = self.current.unwrap_or(0) as isize;
-        let count = self.tracks.len() as isize;
-        let next = (current + delta).rem_euclid(count);
+        let current = self.current_index().unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(count as isize);
         self.play_index(next as usize, window, cx);
     }
 
@@ -297,7 +364,9 @@ impl PlayerView {
     }
 
     fn seek_by(&mut self, delta: f64, cx: &mut Context<Self>) {
-        let Some(snapshot) = &self.snapshot else { return };
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
         if let Some(player) = &self.player {
             let target = (snapshot.position + delta).clamp(0.0, snapshot.duration.max(0.0));
             player.seek(target);
@@ -318,9 +387,9 @@ impl PlayerView {
         };
 
         // 解码一张 1000×1000 的 JPEG 大约几毫秒，但列表切换时不该卡住 UI 线程。
-        let task = cx.background_executor().spawn(async move {
-            cover::decode(&bytes, 640)
-        });
+        let task = cx
+            .background_executor()
+            .spawn(async move { cover::decode(&bytes, 640) });
         cx.spawn(async move |this, cx| {
             let decoded = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -351,12 +420,55 @@ impl PlayerView {
             return;
         }
 
-        let start = self.tracks.len();
-        // 先放占位：文件名立刻出现在列表里，标签慢慢补。
-        self.tracks
-            .extend(paths.iter().map(|path| Arc::new(TrackMeta::placeholder(path))));
+        // 同一个文件只进列表一次：重复拖放、文件夹里重叠的目录都会撞上这一条。
+        let mut seen: HashSet<String> = self
+            .active_tracks()
+            .iter()
+            .map(|track| path_key(&track.path))
+            .collect();
+        let requested_first = paths.first().map(|path| path_key(path));
+        let mut duplicates = 0usize;
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| {
+                let fresh = seen.insert(path_key(path));
+                if !fresh {
+                    duplicates += 1;
+                }
+                fresh
+            })
+            .collect();
 
-        let count = paths.len();
+        if paths.is_empty() {
+            // 「打开文件」点了列表里已有的那首：切过去播，而不是什么都不发生。
+            if play_first
+                && let Some(key) = requested_first
+                && let Some(index) = self
+                    .active_tracks()
+                    .iter()
+                    .position(|track| path_key(&track.path) == key)
+            {
+                self.play_index(index, window, cx);
+                return;
+            }
+            self.notice = Some((
+                format!("已经在当前列表里，跳过 {duplicates} 首"),
+                Instant::now(),
+            ));
+            cx.notify();
+            return;
+        }
+
+        let list_id = self.playlists[self.active].id;
+        let start = self.playlists[self.active].tracks.len();
+        // 先放占位：文件名立刻出现在列表里，标签慢慢补。
+        self.playlists[self.active].tracks.extend(
+            paths
+                .iter()
+                .map(|path| Arc::new(TrackMeta::placeholder(path))),
+        );
+
+        let added = paths.len();
         let task = cx.background_executor().spawn(async move {
             paths
                 .into_iter()
@@ -366,16 +478,35 @@ impl PlayerView {
         cx.spawn(async move |this, cx| {
             let metas = task.await;
             let _ = this.update(cx, |this, cx| {
-                for (offset, meta) in metas.into_iter().enumerate() {
-                    if let Some(slot) = this.tracks.get_mut(start + offset) {
-                        *slot = meta;
-                    }
-                }
-                // 标签回来之后重新看一次封面：`play_index` 当时拿到的还是占位曲目，
+                // 按列表 id + 路径回填：用户中途重排、删歌、切列表都不会写错位置。
+                let playing_path = this.playing.as_ref().map(|track| track.path.clone());
+                let updated = this
+                    .playlists
+                    .iter_mut()
+                    .find(|list| list.id == list_id)
+                    .and_then(|list| {
+                        for meta in metas {
+                            if let Some(slot) =
+                                list.tracks.iter_mut().find(|track| track.path == meta.path)
+                            {
+                                *slot = meta;
+                            }
+                        }
+                        let playing_path = playing_path?;
+                        list.tracks
+                            .iter()
+                            .find(|track| track.path == playing_path)
+                            .cloned()
+                    });
+
+                // 标签回来之后重新看一次封面：`play_track` 当时拿到的还是占位曲目，
                 // 它没有封面，`cover_for` 却已经把路径记下了——不把这条记录清掉，
                 // `load_cover` 会以为「这首看过、就是没封面」，封面永远不上屏。
-                if let Some(index) = this.current
-                    && let Some(track) = this.tracks.get(index).cloned()
+                if let Some(track) = updated
+                    && this
+                        .playing
+                        .as_ref()
+                        .is_some_and(|playing| playing.path == track.path)
                 {
                     // 引擎里存的可能还是占位曲目（没有时长），把真实标签补进去，
                     // 否则进度条算不出比例、总时长显示 0:00。
@@ -385,6 +516,7 @@ impl PlayerView {
                     if this.cover.is_none() && this.cover_for.as_ref() == Some(&track.path) {
                         this.cover_for = None;
                     }
+                    this.playing = Some(track.clone());
                     this.load_cover(&track, cx);
                 }
                 cx.notify();
@@ -392,10 +524,15 @@ impl PlayerView {
         })
         .detach();
 
-        if play_first || self.current.is_none() {
+        if play_first || self.playing.is_none() {
             self.play_index(start, window, cx);
         } else {
-            self.notice = Some((format!("已加入 {count} 首"), Instant::now()));
+            let text = if duplicates > 0 {
+                format!("已加入 {added} 首，跳过 {duplicates} 首重复")
+            } else {
+                format!("已加入 {added} 首")
+            };
+            self.notice = Some((text, Instant::now()));
             cx.notify();
         }
     }
@@ -460,27 +597,105 @@ impl PlayerView {
     fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dark = !self.dark;
         Theme::change(
-            if self.dark { ThemeMode::Dark } else { ThemeMode::Light },
+            if self.dark {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            },
             Some(window),
             cx,
         );
         cx.notify();
     }
 
-    fn remove_current(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.current else { return };
-        self.tracks.remove(index);
-        if self.tracks.is_empty() {
-            self.current = None;
+    /// 从当前列表移除一行；移掉的正是正在播的那首就停下，
+    /// 免得界面已经没这首歌、引擎还在出声。
+    fn remove_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(track) = self.active_tracks().get(index).cloned() else {
+            return;
+        };
+        self.playlists[self.active].tracks.remove(index);
+        if self
+            .playing
+            .as_ref()
+            .is_some_and(|playing| playing.path == track.path)
+        {
+            self.playing = None;
             self.cover = None;
             self.cover_for = None;
             if let Some(player) = &self.player {
                 player.stop();
             }
-        } else {
-            self.current = Some(index.min(self.tracks.len() - 1));
         }
         cx.notify();
+    }
+
+    fn remove_current(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.current_index() {
+            self.remove_track(index, cx);
+        }
+    }
+
+    /// 上移 / 下移一行。只改列表顺序，不影响正在播放的曲目。
+    fn move_track(&mut self, index: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(target) = index.checked_add_signed(delta) else {
+            return;
+        };
+        let tracks = &mut self.playlists[self.active].tracks;
+        if target >= tracks.len() {
+            return;
+        }
+        tracks.swap(index, target);
+        cx.notify();
+    }
+
+    fn new_playlist(&mut self, cx: &mut Context<Self>) {
+        let id = self.next_playlist_id;
+        self.next_playlist_id += 1;
+        self.playlists.push(Playlist {
+            id,
+            name: format!("列表 {id}"),
+            tracks: Vec::new(),
+        });
+        self.active = self.playlists.len() - 1;
+        self.notice = Some((format!("已新建「列表 {id}」"), Instant::now()));
+        cx.notify();
+    }
+
+    fn switch_playlist(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.playlists.len() || index == self.active {
+            return;
+        }
+        self.active = index;
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 删除一个播放列表：至少保留一个；删掉正在看的那个就落到相邻的列表。
+    /// 播放不因此中断——正在响的曲目哪怕来自被删的列表，也会一直播完。
+    fn remove_playlist(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.playlists.len() <= 1 || index >= self.playlists.len() {
+            return;
+        }
+        self.playlists.remove(index);
+        if index == self.active {
+            self.active = index.min(self.playlists.len() - 1);
+        } else if index < self.active {
+            self.active -= 1;
+        }
+        cx.notify();
+    }
+}
+
+/// 判断「同一个文件」用的键：先规范化掉 `.` / `..` 与大小写盘符的差异，
+/// Windows 上再统一小写。规范化失败（文件刚被删）就退回原始路径。
+fn path_key(path: &Path) -> String {
+    let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = full.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
     }
 }
 
@@ -522,7 +737,9 @@ fn scan_folder(folder: &std::path::Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![(folder.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -567,15 +784,24 @@ impl Render for PlayerView {
         let danger = theme.danger;
 
         let snapshot = self.snapshot.clone();
-        let state = snapshot.as_ref().map(|snapshot| snapshot.state).unwrap_or(PlaybackState::Idle);
-        let position = snapshot.as_ref().map(|snapshot| snapshot.position).unwrap_or(0.0);
-        let duration = snapshot.as_ref().map(|snapshot| snapshot.duration).unwrap_or(0.0);
-        let volume = snapshot.as_ref().map(|snapshot| snapshot.volume).unwrap_or(0.8);
+        let state = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.state)
+            .unwrap_or(PlaybackState::Idle);
+        let position = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.position)
+            .unwrap_or(0.0);
+        let duration = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.duration)
+            .unwrap_or(0.0);
+        let volume = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.volume)
+            .unwrap_or(0.8);
 
-        let current_track = self
-            .current
-            .and_then(|index| self.tracks.get(index))
-            .cloned();
+        let current_track = self.playing.clone();
         let title = current_track
             .as_ref()
             .map(|track| track.title.clone())
@@ -599,7 +825,9 @@ impl Render for PlayerView {
         let spec_line = current_track
             .as_ref()
             .map(|track| track.spec_line())
-            .unwrap_or_else(|| "支持 MP3 / FLAC / WAV / M4A / OGG / Opus / WMA / APE / DSD 等".into());
+            .unwrap_or_else(|| {
+                "支持 MP3 / FLAC / WAV / M4A / OGG / Opus / WMA / APE / DSD 等".into()
+            });
         let album = current_track
             .as_ref()
             .map(|track| track.album.clone())
@@ -616,7 +844,11 @@ impl Render for PlayerView {
         };
 
         let playing = matches!(state, PlaybackState::Playing);
-        let play_icon = if playing { IconName::Pause } else { IconName::Play };
+        let play_icon = if playing {
+            IconName::Pause
+        } else {
+            IconName::Play
+        };
 
         let notice = self
             .notice
@@ -643,14 +875,16 @@ impl Render for PlayerView {
                         if let Some(player) = &this.player {
                             let volume = (player.snapshot().volume + 0.05).min(1.0);
                             player.set_volume(volume);
-                            this.volume.update(cx, |state, cx| state.set_value(volume, window, cx));
+                            this.volume
+                                .update(cx, |state, cx| state.set_value(volume, window, cx));
                         }
                     }
                     "down" => {
                         if let Some(player) = &this.player {
                             let volume = (player.snapshot().volume - 0.05).max(0.0);
                             player.set_volume(volume);
-                            this.volume.update(cx, |state, cx| state.set_value(volume, window, cx));
+                            this.volume
+                                .update(cx, |state, cx| state.set_value(volume, window, cx));
                         }
                     }
                     "n" => this.step(1, window, cx),
@@ -697,17 +931,15 @@ impl Render for PlayerView {
                         .child(img("app-icon.png").size(px(28.0)).flex_shrink_0())
                         .child(
                             v_flex()
-                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("声波"))
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(muted_foreground)
-                                        .child(format!(
-                                            "{} 首 · {}",
-                                            self.tracks.len(),
-                                            backend_note
-                                        )),
-                                ),
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("声波"),
+                                )
+                                .child(div().text_xs().text_color(muted_foreground).child(
+                                    format!("{} 首 · {}", self.active_tracks().len(), backend_note),
+                                )),
                         ),
                 )
                 .child(
@@ -720,7 +952,9 @@ impl Render for PlayerView {
                                 .small()
                                 .icon(IconName::FilePlus)
                                 .label("文件")
-                                .on_click(cx.listener(|this, _, window, cx| this.open_files(window, cx))),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.open_files(window, cx)),
+                                ),
                         )
                         .child(
                             Button::new("open-folder")
@@ -728,35 +962,39 @@ impl Render for PlayerView {
                                 .small()
                                 .icon(IconName::FolderOpen)
                                 .label("文件夹")
-                                .on_click(cx.listener(|this, _, window, cx| this.open_folder(window, cx))),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.open_folder(window, cx)),
+                                ),
                         )
                         .child(
                             Button::new("theme")
                                 .ghost()
                                 .small()
-                                .icon(if self.dark { IconName::Sun } else { IconName::Moon })
-                                .on_click(cx.listener(|this, _, window, cx| this.toggle_theme(window, cx))),
+                                .icon(if self.dark {
+                                    IconName::Sun
+                                } else {
+                                    IconName::Moon
+                                })
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.toggle_theme(window, cx)
+                                    }),
+                                ),
                         )
                         .when(SHOW_WINDOW_CONTROLS, |this| {
-                            this.child(
-                                div()
-                                    .w(px(1.0))
-                                    .h(px(20.0))
-                                    .mx_1()
-                                    .bg(border),
-                            )
-                            .child(
-                                control("win-min", IconName::Minus, false)
-                                    .on_click(|_, window, _| window.minimize_window()),
-                            )
-                            .child(
-                                control("win-max", IconName::Maximize2, false)
-                                    .on_click(|_, window, _| window.zoom_window()),
-                            )
-                            .child(
-                                control("win-close", IconName::X, true)
-                                    .on_click(|_, window, _| window.remove_window()),
-                            )
+                            this.child(div().w(px(1.0)).h(px(20.0)).mx_1().bg(border))
+                                .child(
+                                    control("win-min", IconName::Minus, false)
+                                        .on_click(|_, window, _| window.minimize_window()),
+                                )
+                                .child(
+                                    control("win-max", IconName::Maximize2, false)
+                                        .on_click(|_, window, _| window.zoom_window()),
+                                )
+                                .child(
+                                    control("win-close", IconName::X, true)
+                                        .on_click(|_, window, _| window.remove_window()),
+                                )
                         }),
                 ),
         );
@@ -772,7 +1010,11 @@ impl Render for PlayerView {
                     .bg(danger.opacity(0.08))
                     .border_b_1()
                     .border_color(danger.opacity(0.25))
-                    .child(Icon::new(IconName::TriangleAlert).size(px(14.0)).text_color(danger))
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(14.0))
+                            .text_color(danger),
+                    )
                     .child(div().text_xs().text_color(danger).child(error)),
             );
         } else if let Some(notice) = notice {
@@ -789,14 +1031,94 @@ impl Render for PlayerView {
         }
 
         // —— 主体：列表 + 正在播放 ——
+        // 播放列表标签栏：点标签切换，标签上的 × 删掉整个列表（最后一个不给删）。
+        let mut playlist_bar = h_flex()
+            .flex_none()
+            .px_2()
+            .py_2()
+            .gap_1()
+            .flex_wrap()
+            .items_center()
+            .border_b_1()
+            .border_color(border);
+
+        for (index, playlist) in self.playlists.iter().enumerate() {
+            let selected = index == self.active;
+            let removable = self.playlists.len() > 1;
+            playlist_bar = playlist_bar.child(
+                h_flex()
+                    .id(format!("playlist-tab:{index}"))
+                    .test_support()
+                    .h(px(26.0))
+                    .px_2()
+                    .gap_1()
+                    .rounded_md()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_xs()
+                    .when(selected, |this| {
+                        this.bg(primary.opacity(0.14)).text_color(primary)
+                    })
+                    .when(!selected, |this| this.text_color(muted_foreground))
+                    .hover(|this| this.bg(muted))
+                    .on_click(cx.listener(move |this, _, _, cx| this.switch_playlist(index, cx)))
+                    .child(
+                        div()
+                            .max_w(px(110.0))
+                            .truncate()
+                            .child(playlist.name.clone()),
+                    )
+                    .when(removable, |this| {
+                        this.child(
+                            div()
+                                .id(format!("playlist-remove:{index}"))
+                                .test_support()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                // 图标本身只有 12px，把点击区撑到 16px 才好点。
+                                .size(px(16.0))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .opacity(0.45)
+                                .hover(|this| this.opacity(1.0))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // 不拦下来的话，点 × 会先把这个列表切到前台再删。
+                                    cx.stop_propagation();
+                                    this.remove_playlist(index, cx);
+                                }))
+                                .child(Icon::new(IconName::X).size(px(12.0))),
+                        )
+                    }),
+            );
+        }
+
+        playlist_bar = playlist_bar.child(
+            div()
+                .id("new-playlist")
+                .test_support()
+                .child(
+                    Button::new("new-playlist-button")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Plus)
+                        .tooltip("新建播放列表"),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.new_playlist(cx))),
+        );
+
+        let tracks = self.active_tracks();
+        let current_index = self.current_index();
+
         let mut list = v_flex()
             .id("playlist")
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .p_2()
             .gap_1();
 
-        if self.tracks.is_empty() {
+        if tracks.is_empty() {
             list = list.child(
                 div()
                     .p_4()
@@ -806,8 +1128,8 @@ impl Render for PlayerView {
             );
         }
 
-        for (index, track) in self.tracks.iter().enumerate() {
-            let selected = self.current == Some(index);
+        for (index, track) in tracks.iter().enumerate() {
+            let selected = current_index == Some(index);
             let is_current = selected && playing;
             let duration_text = track
                 .duration
@@ -818,14 +1140,32 @@ impl Render for PlayerView {
             } else {
                 format!("{} · {}", track.artist, track.format)
             };
+            // group 名带行号：同名的话，鼠标划过一行会让每一行的按钮都亮起来。
+            let row_group = format!("track-row:{index}");
+            // Button 是 RenderOnce，挂不上 test_support；包一层也能顺手给它一个可点击的 id。
+            let action = |id: &'static str, icon: IconName, tooltip: &'static str| {
+                div()
+                    .id(format!("{id}:{index}"))
+                    .test_support()
+                    .cursor_pointer()
+                    .child(
+                        Button::new((id, index))
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(icon)
+                            .tooltip(tooltip),
+                    )
+            };
             list = list.child(
                 h_flex()
                     .id(format!("track:{index}"))
                     .test_support()
+                    .group(row_group.clone())
                     .flex_none()
                     .h(px(52.0))
                     .px_3()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
                     .rounded_md()
                     .cursor_pointer()
@@ -840,15 +1180,21 @@ impl Render for PlayerView {
                     }))
                     .child(
                         div()
-                            .w(px(20.0))
+                            .w(px(18.0))
                             .flex()
                             .justify_center()
                             .text_xs()
                             .text_color(if selected { primary } else { muted_foreground })
                             .child(if is_current {
-                                Icon::new(IconName::AudioLines).size(px(14.0)).text_color(primary).into_any_element()
+                                Icon::new(IconName::AudioLines)
+                                    .size(px(14.0))
+                                    .text_color(primary)
+                                    .into_any_element()
                             } else if selected {
-                                Icon::new(IconName::Pause).size(px(14.0)).text_color(primary).into_any_element()
+                                Icon::new(IconName::Pause)
+                                    .size(px(14.0))
+                                    .text_color(primary)
+                                    .into_any_element()
                             } else {
                                 div().child(format!("{}", index + 1)).into_any_element()
                             }),
@@ -878,6 +1224,39 @@ impl Render for PlayerView {
                             .text_xs()
                             .text_color(muted_foreground)
                             .child(duration_text),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_0p5()
+                            .items_center()
+                            // 平时淡一点，鼠标落在这一行才完全显出来：
+                            // 一直亮着的小图标会把标题挤得没有呼吸空间。
+                            .opacity(0.35)
+                            .group_hover(row_group, |this| this.opacity(1.0))
+                            .child(action("track-up", IconName::ChevronUp, "上移").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    // 行本身也在监听点击，不拦住就会顺带切歌。
+                                    cx.stop_propagation();
+                                    this.move_track(index, -1, cx);
+                                }),
+                            ))
+                            .child(
+                                action("track-down", IconName::ChevronDown, "下移").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.move_track(index, 1, cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                action("track-remove", IconName::Trash, "从列表移除").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.remove_track(index, cx);
+                                    }),
+                                ),
+                            ),
                     ),
             );
         }
@@ -944,13 +1323,23 @@ impl Render for PlayerView {
                             .truncate()
                             .child(title),
                     )
-                    .child(div().text_sm().text_color(muted_foreground).text_center().child(artist))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted_foreground)
+                            .text_center()
+                            .child(artist),
+                    )
                     .child(
                         div()
                             .text_xs()
                             .text_color(muted_foreground)
                             .text_center()
-                            .child(if album.is_empty() { spec_line } else { format!("{album} · {spec_line}") }),
+                            .child(if album.is_empty() {
+                                spec_line
+                            } else {
+                                format!("{album} · {spec_line}")
+                            }),
                     ),
             )
             .child(spectrum_element);
@@ -959,13 +1348,14 @@ impl Render for PlayerView {
             .flex_1()
             .min_h_0()
             .child(
-                div()
+                v_flex()
                     .w(px(SIDEBAR_WIDTH))
                     .h_full()
                     .flex_none()
                     .border_r_1()
                     .border_color(border)
                     .bg(muted.opacity(0.35))
+                    .child(playlist_bar)
                     .child(list),
             )
             .child(now_playing);
@@ -1019,69 +1409,79 @@ impl Render for PlayerView {
                     })),
             );
 
-        let footer = v_flex()
-            .flex_none()
-            .px_6()
-            .pt_3()
-            .pb_4()
-            .gap_2()
-            .border_t_1()
-            .border_color(border)
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .text_xs()
-                            .text_color(muted_foreground)
-                            .child(format_time(position)),
-                    )
-                    .child(div().flex_1().child(Slider::new(&self.progress).horizontal()))
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .text_xs()
-                            .text_color(muted_foreground)
-                            .child(format_time(duration)),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        h_flex().w(px(220.0)).gap_2().items_center().child(
+        let footer =
+            v_flex()
+                .flex_none()
+                .px_6()
+                .pt_3()
+                .pb_4()
+                .gap_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(
                             div()
+                                .w(px(44.0))
                                 .text_xs()
                                 .text_color(muted_foreground)
-                                .child(if self.tracks.is_empty() {
+                                .child(format_time(position)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Slider::new(&self.progress).horizontal()),
+                        )
+                        .child(
+                            div()
+                                .w(px(44.0))
+                                .text_xs()
+                                .text_color(muted_foreground)
+                                .child(format_time(duration)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(h_flex().w(px(220.0)).gap_2().items_center().child(
+                            div().text_xs().text_color(muted_foreground).child(
+                                if tracks.is_empty() {
                                     String::new()
                                 } else {
-                                    format!("{}/{}", self.current.map(|index| index + 1).unwrap_or(0), self.tracks.len())
-                                }),
+                                    format!(
+                                        "{}/{}",
+                                        current_index.map(|index| index + 1).unwrap_or(0),
+                                        tracks.len()
+                                    )
+                                },
+                            ),
+                        ))
+                        .child(controls)
+                        .child(
+                            h_flex()
+                                .w(px(220.0))
+                                .gap_2()
+                                .items_center()
+                                .justify_end()
+                                .child(
+                                    Icon::new(if volume <= 0.001 {
+                                        IconName::VolumeX
+                                    } else {
+                                        IconName::Volume2
+                                    })
+                                    .size(px(16.0))
+                                    .text_color(muted_foreground),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(110.0))
+                                        .child(Slider::new(&self.volume).horizontal()),
+                                ),
                         ),
-                    )
-                    .child(controls)
-                    .child(
-                        h_flex()
-                            .w(px(220.0))
-                            .gap_2()
-                            .items_center()
-                            .justify_end()
-                            .child(
-                                Icon::new(if volume <= 0.001 {
-                                    IconName::VolumeX
-                                } else {
-                                    IconName::Volume2
-                                })
-                                .size(px(16.0))
-                                .text_color(muted_foreground),
-                            )
-                            .child(div().w(px(110.0)).child(Slider::new(&self.volume).horizontal())),
-                    ),
-            );
+                );
 
         root.child(footer)
     }
@@ -1135,7 +1535,9 @@ mod tests {
             let slot = slot.clone();
             cx.add_window(move |window, cx| {
                 let view = cx.new(|cx| PlayerView::new(window, cx));
-                view.update(cx, |view, cx| view.add_paths(paths.clone(), false, window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(paths.clone(), false, window, cx)
+                });
                 *slot.borrow_mut() = Some(view.clone());
                 Harness { view }
             })
@@ -1149,7 +1551,7 @@ mod tests {
         let view = slot.borrow().clone().expect("视图没有建出来");
         let state = cx.update(|app| {
             let view = view.read(app);
-            (view.tracks.len(), view.current)
+            (view.active_tracks().len(), view.current_index())
         });
         assert_eq!(state.0, 3, "三首样本都该进列表");
         assert_eq!(state.1, Some(0), "加载完成后应当从第一首开始");
@@ -1161,7 +1563,7 @@ mod tests {
         })
         .unwrap();
 
-        let current = cx.update(|app| view.read(app).current);
+        let current = cx.update(|app| view.read(app).current_index());
         assert_eq!(current, Some(1), "点第二行之后当前曲目应当是它");
     }
 
@@ -1181,7 +1583,9 @@ mod tests {
             let slot = slot.clone();
             cx.add_window(move |window, cx| {
                 let view = cx.new(|cx| PlayerView::new(window, cx));
-                view.update(cx, |view, cx| view.add_paths(first_two.clone(), false, window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(first_two.clone(), false, window, cx)
+                });
                 *slot.borrow_mut() = Some(view.clone());
                 Harness { view }
             })
@@ -1193,7 +1597,7 @@ mod tests {
         .unwrap();
 
         let view = slot.borrow().clone().expect("视图没有建出来");
-        assert_eq!(cx.update(|app| view.read(app).current), Some(0));
+        assert_eq!(cx.update(|app| view.read(app).current_index()), Some(0));
 
         let third = paths[2].clone();
         cx.update_window(handle.into(), |_, window, cx| {
@@ -1202,7 +1606,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cx.update(|app| view.read(app).current),
+            cx.update(|app| view.read(app).current_index()),
             Some(2),
             "打开文件后应当直接播它，而不是只加进列表"
         );
@@ -1230,6 +1634,280 @@ mod tests {
         .unwrap();
 
         let view = slot.borrow().clone().unwrap();
-        assert_eq!(cx.update(|app| view.read(app).tracks.len()), 0);
+        assert_eq!(cx.update(|app| view.read(app).active_tracks().len()), 0);
+    }
+
+    #[gpui_kit::test]
+    fn the_same_file_cannot_enter_a_playlist_twice(cx: &mut TestAppContext) {
+        let paths = samples();
+        if paths.len() < 3 {
+            eprintln!("跳过：缺少 testdata 样本");
+            return;
+        }
+
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            let first = paths[0].clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(vec![first.clone()], false, window, cx);
+                    // 再从「文件」按钮加一次同一个文件：不该多出一行。
+                    view.add_paths(vec![first], false, window, cx);
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        assert_eq!(
+            cx.update(|app| view.read(app).active_tracks().len()),
+            1,
+            "同一个文件只能进列表一次"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn tracks_can_be_reordered_and_removed(cx: &mut TestAppContext) {
+        let paths = samples();
+        if paths.len() < 3 {
+            eprintln!("跳过：缺少 testdata 样本");
+            return;
+        }
+
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(paths.clone(), false, window, cx)
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        let order = |app: &mut gpui_kit::App| -> Vec<PathBuf> {
+            view.read(app)
+                .active_tracks()
+                .iter()
+                .map(|track| track.path.clone())
+                .collect()
+        };
+        let before = cx.update(|app| order(app));
+
+        cx.update(|app| view.update(app, |view, cx| view.move_track(0, 1, cx)));
+        let after = cx.update(|app| order(app));
+        assert_eq!(after[0], before[1], "下移之后第二首应当排到第一行");
+        assert_eq!(after[1], before[0]);
+        assert_eq!(after[2], before[2]);
+
+        cx.update(|app| view.update(app, |view, cx| view.remove_track(1, cx)));
+        let left = cx.update(|app| order(app));
+        assert_eq!(left, vec![before[1].clone(), before[2].clone()]);
+    }
+
+    #[gpui_kit::test]
+    fn playlists_hold_their_own_tracks(cx: &mut TestAppContext) {
+        let paths = samples();
+        if paths.len() < 3 {
+            eprintln!("跳过：缺少 testdata 样本");
+            return;
+        }
+
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            let first_two = paths[..2].to_vec();
+            let third = paths[2].clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(first_two, false, window, cx);
+                    view.new_playlist(cx);
+                    view.add_paths(vec![third], false, window, cx);
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        let state = cx.update(|app| {
+            let view = view.read(app);
+            (
+                view.playlists.len(),
+                view.active,
+                view.playlists
+                    .iter()
+                    .map(|list| list.tracks.len())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(state.0, 2, "应当有两个播放列表");
+        assert_eq!(state.1, 1, "新建之后应当切到新列表");
+        assert_eq!(state.2, vec![2, 1], "两个列表各管各的曲目");
+
+        cx.update(|app| view.update(app, |view, cx| view.switch_playlist(0, cx)));
+        assert_eq!(cx.update(|app| view.read(app).active_tracks().len()), 2);
+
+        cx.update(|app| view.update(app, |view, cx| view.remove_playlist(0, cx)));
+        let left = cx.update(|app| {
+            let view = view.read(app);
+            (
+                view.playlists.len(),
+                view.active,
+                view.playlists[0].name.clone(),
+            )
+        });
+        assert_eq!(left.0, 1, "至少保留一个播放列表");
+        assert_eq!(left.1, 0);
+        assert_eq!(left.2, "列表 2", "删掉列表 1 之后列表 2 应当还在");
+    }
+
+    #[gpui_kit::test]
+    fn row_buttons_move_and_remove_tracks(cx: &mut TestAppContext) {
+        let paths = samples();
+        if paths.len() < 3 {
+            eprintln!("跳过：缺少 testdata 样本");
+            return;
+        }
+
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(paths.clone(), false, window, cx)
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        let names = |app: &mut gpui_kit::App| -> Vec<String> {
+            view.read(app)
+                .active_tracks()
+                .iter()
+                .filter_map(|track| {
+                    track
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .collect()
+        };
+        let before = cx.update(|app| names(app));
+
+        // 第三行点「上移」：顺序换了，正在播的曲目不该被换掉。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("track-up:2", cx);
+        })
+        .unwrap();
+        let after = cx.update(|app| names(app));
+        assert_eq!(
+            after,
+            vec![before[0].clone(), before[2].clone(), before[1].clone()],
+            "上移应当只交换相邻两行"
+        );
+        assert_eq!(
+            cx.update(|app| view.read(app).current_index()),
+            Some(0),
+            "点上移不该顺带切歌"
+        );
+
+        // 再点第三行的删除：只少这一行。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("track-remove:2", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            cx.update(|app| names(app)),
+            vec![before[0].clone(), before[2].clone()]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn playlist_bar_switches_and_adds_lists(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("new-playlist", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.update(|app| view.read(app).playlists.len()), 2);
+        assert_eq!(
+            cx.update(|app| view.read(app).active),
+            1,
+            "新建之后应当切到新列表"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("playlist-tab:0", cx);
+        })
+        .unwrap();
+        assert_eq!(cx.update(|app| view.read(app).active), 0);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("playlist-remove:0", cx);
+        })
+        .unwrap();
+        let left = cx.update(|app| {
+            let view = view.read(app);
+            (view.playlists.len(), view.playlists[0].name.clone())
+        });
+        assert_eq!(left.0, 1);
+        assert_eq!(left.1, "列表 2", "删掉列表 1 之后列表 2 应当还在");
     }
 }
