@@ -59,6 +59,16 @@ impl RepeatMode {
             RepeatMode::One => "单曲循环",
         }
     }
+
+    /// 三种模式必须用不同图标，否则用户看不出当前处于哪种循环状态。
+    fn icon(self) -> IconName {
+        match self {
+            // 顺序播放放到列表末尾就停，用带斜杠的循环图标表示「不循环」。
+            RepeatMode::Off => IconName::RepeatOff,
+            RepeatMode::All => IconName::Repeat,
+            RepeatMode::One => IconName::Repeat1,
+        }
+    }
 }
 
 /// 一个播放列表。
@@ -1938,10 +1948,7 @@ impl Render for PlayerView {
                 Button::new("repeat")
                     .ghost()
                     .small()
-                    .icon(match self.repeat {
-                        RepeatMode::One => IconName::Repeat1,
-                        _ => IconName::Repeat,
-                    })
+                    .icon(self.repeat.icon())
                     .tooltip(self.repeat.label())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.repeat = this.repeat.next();
@@ -2062,6 +2069,21 @@ mod tests {
             .map(|name| dir.join(name))
             .filter(|path| path.is_file())
             .collect()
+    }
+
+    #[test]
+    fn repeat_modes_use_distinct_icons() {
+        let icons = [
+            RepeatMode::Off.icon(),
+            RepeatMode::All.icon(),
+            RepeatMode::One.icon(),
+        ];
+        for (index, icon) in icons.iter().enumerate() {
+            assert!(
+                !icons[index + 1..].contains(icon),
+                "三种循环模式的图标必须能区分"
+            );
+        }
     }
 
     #[gpui_kit::test]
