@@ -751,7 +751,15 @@ impl PlayerView {
         }
     }
 
-    /// 把第 `from` 行搬到 `to` 的位置（拖动排序）。只改列表顺序，不影响正在播放的曲目。
+    /// 上移 / 下移一行。只改列表顺序，不影响正在播放的曲目。
+    fn move_track(&mut self, index: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(target) = index.checked_add_signed(delta) else {
+            return;
+        };
+        self.move_track_to(index, target, cx);
+    }
+
+    /// 把第 `from` 行搬到 `to` 的位置（拖动排序）。
     fn move_track_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         let tracks = &mut self.playlists[self.active].tracks;
         if from >= tracks.len() || to >= tracks.len() || from == to {
@@ -1776,10 +1784,24 @@ impl Render for PlayerView {
                             // 一直亮着的小图标会把标题挤得没有呼吸空间。
                             .opacity(0.35)
                             .group_hover(row_group, |this| this.opacity(1.0))
+                            .child(action("track-up", IconName::ChevronUp, "上移").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    // 行本身也在监听点击，不拦住就会顺带切歌。
+                                    cx.stop_propagation();
+                                    this.move_track(index, -1, cx);
+                                }),
+                            ))
+                            .child(
+                                action("track-down", IconName::ChevronDown, "下移").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.move_track(index, 1, cx);
+                                    }),
+                                ),
+                            )
                             .child(
                                 action("track-remove", IconName::Trash, "从列表移除").on_click(
                                     cx.listener(move |this, _, _, cx| {
-                                        // 行本身也在监听点击，不拦住就会顺带切歌。
                                         cx.stop_propagation();
                                         this.remove_track(index, cx);
                                     }),
@@ -2258,10 +2280,9 @@ mod tests {
         };
         let before = cx.update(|app| order(app));
 
-        // 和拖动落点走同一条路径：把第一行搬到第二行的位置。
-        cx.update(|app| view.update(app, |view, cx| view.move_track_to(0, 1, cx)));
+        cx.update(|app| view.update(app, |view, cx| view.move_track(0, 1, cx)));
         let after = cx.update(|app| order(app));
-        assert_eq!(after[0], before[1], "往下搬之后第二首应当排到第一行");
+        assert_eq!(after[0], before[1], "下移之后第二首应当排到第一行");
         assert_eq!(after[1], before[0]);
         assert_eq!(after[2], before[2]);
 
@@ -2532,7 +2553,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn row_remove_button_deletes_only_that_row(cx: &mut TestAppContext) {
+    fn row_buttons_move_and_remove_tracks(cx: &mut TestAppContext) {
         let paths = samples();
         if paths.len() < 3 {
             eprintln!("跳过：缺少 testdata 样本");
@@ -2574,19 +2595,31 @@ mod tests {
         };
         let before = cx.update(|app| names(app));
 
-        // 点第三行的删除：只少这一行，也不该顺带切歌。
+        // 第三行点「上移」：顺序换了，正在播的曲目不该被换掉。
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("track-up:2", cx);
+        })
+        .unwrap();
+        let after = cx.update(|app| names(app));
+        assert_eq!(
+            after,
+            vec![before[0].clone(), before[2].clone(), before[1].clone()],
+            "上移应当只交换相邻两行"
+        );
+        assert_eq!(
+            cx.update(|app| view.read(app).current_index()),
+            Some(0),
+            "点上移不该顺带切歌"
+        );
+
+        // 再点第三行的删除：只少这一行。
         cx.update_window(handle.into(), |_, window, cx| {
             window.click("track-remove:2", cx);
         })
         .unwrap();
         assert_eq!(
             cx.update(|app| names(app)),
-            vec![before[0].clone(), before[1].clone()]
-        );
-        assert_eq!(
-            cx.update(|app| view.read(app).current_index()),
-            Some(0),
-            "点删除不该顺带切歌"
+            vec![before[0].clone(), before[2].clone()]
         );
     }
 
