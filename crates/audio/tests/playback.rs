@@ -12,6 +12,65 @@ fn testdata_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
 }
 
+/// 队列内部接歌：第一首放完由引擎自己接第二首，中途不该出现 Ended。
+#[test]
+fn queue_advances_without_stopping_between_tracks() {
+    let path = testdata_dir().join("tone.flac");
+    if !path.is_file() {
+        eprintln!("跳过：缺少 testdata/tone.flac");
+        return;
+    }
+    let player = match Player::new() {
+        Ok(player) => player,
+        Err(error) => {
+            eprintln!("跳过：没有可用输出设备（{error:#}）");
+            return;
+        }
+    };
+
+    let first = Arc::new(TrackMeta::probe(&path));
+    let second = Arc::new(TrackMeta::probe(&path));
+    player.play(vec![first, second], 0);
+    player.set_paused(false);
+
+    // 样本 1.2 秒：等到队列下标变成 1，说明引擎自己接上了第二首。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut snapshot = player.snapshot();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(40));
+        snapshot = player.snapshot();
+        assert_ne!(
+            snapshot.state,
+            PlaybackState::Failed,
+            "队列播放失败：{:?}",
+            snapshot.error
+        );
+        assert_ne!(
+            snapshot.state,
+            PlaybackState::Ended,
+            "队列里还有下一首，却报了播完：{snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.finished_serial, 0,
+            "整条队列还没放完，播完序号却加了：{snapshot:?}"
+        );
+        if snapshot.queue_index == Some(1) {
+            break;
+        }
+    }
+
+    println!(
+        "接歌后 状态={:?} 下标={:?} 位置={:.3}s 时长={:.3}s",
+        snapshot.state, snapshot.queue_index, snapshot.position, snapshot.duration
+    );
+    assert_eq!(snapshot.queue_index, Some(1), "没有自动接到第二首");
+    assert!(
+        snapshot.position < 1.0,
+        "接上的第二首位置不该已经跑完：{:.3}s",
+        snapshot.position
+    );
+}
+
 #[test]
 fn plays_a_tone_and_advances_position() {
     let path = testdata_dir().join("tone.flac");

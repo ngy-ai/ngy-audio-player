@@ -356,6 +356,33 @@ impl Shared {
         }
     }
 
+    /// 队列内部接歌：换曲目、归零进度，但**不**进入 Loading。
+    ///
+    /// `begin_load` 会把 `loading` 置真，而 `should_render` 据此让回调静音——
+    /// 那就是用户听到的两首之间的空隙。接歌时缓冲里还压着上一首的尾巴，
+    /// 这条路径只换「接下来往缓冲里写什么」，不该让输出停一下。
+    pub(crate) fn begin_seamless_load(&self, track: std::sync::Arc<TrackMeta>) {
+        self.clear_error();
+        self.ended.store(false, Ordering::Relaxed);
+        self.set_state(1);
+        if let Ok(mut slot) = self.track.lock() {
+            *slot = Some(track.clone());
+        }
+        if let Ok(mut slot) = self.backend.lock() {
+            *slot = None;
+        }
+        self.duration_ms.store(
+            track.duration.map(|d| d.as_millis() as u64).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.baseline_ms.store(0, Ordering::Relaxed);
+        self.position_ms.store(0, Ordering::Relaxed);
+        self.seek_epoch.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut viz) = self.viz.lock() {
+            viz.clear();
+        }
+    }
+
     pub(crate) fn mark_ready(&self, backend: Backend, duration_ms: u64) {
         self.loading.store(false, Ordering::Relaxed);
         self.active.store(true, Ordering::Relaxed);

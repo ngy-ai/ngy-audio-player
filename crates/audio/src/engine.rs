@@ -185,6 +185,17 @@ struct Session {
     /// 解码完毕、缓冲已空，等这一小段时间再判定「播完」，
     /// 免得设备缓冲里最后几十毫秒还没出声就被切歌。
     drain_deadline: Option<Instant>,
+    /// 这一首是否已经尝试过预读下一首。放在会话里，换歌时自动归零。
+    prefetch_attempted: bool,
+}
+
+/// 已经打开、还没接上播放的下一首。
+///
+/// 预读的全部意义在于「提前」：等当前这首放完再打开文件，那几十毫秒就是
+/// 用户听到的空隙。
+struct Prepared {
+    decoder: Box<dyn Decoder>,
+    resampler: Option<StreamResampler>,
 }
 
 /// 引擎持有的播放队列：曲目序列 + 播放顺序 + 游标。
@@ -360,6 +371,8 @@ fn decode_loop(
 ) {
     let mut session: Option<Session> = None;
     let mut queue = Queue::new();
+    // 已经读好、等着接上的下一首。
+    let mut prefetched: Option<(Track, Prepared)> = None;
     shared.set_mode(queue.mode);
 
     loop {
@@ -385,6 +398,8 @@ fn decode_loop(
                     // 只同步列表时保留当前这首；指定了起点就当作用户点了某一首。
                     queue.set_items(items, if play { None } else { keep });
                     if play {
+                        // 用户点了别的曲子：预读的那首不再是要接的那首。
+                        prefetched = None;
                         queue.jump_to(start.unwrap_or(0));
                         // 先把上一首留在缓冲里的尾巴丢掉，**并且等回调真的丢完**再开始
                         // 解码新曲子。顺序很重要：如果先 mark_ready 再置 flush，回调可能
@@ -403,6 +418,7 @@ fn decode_loop(
                     } else {
                         -1
                     };
+                    prefetched = None;
                     if queue.step_wrapping(delta).is_some() {
                         flush_and_wait(&shared);
                         session = queue
@@ -446,6 +462,7 @@ fn decode_loop(
                     }
                 }
                 Command::Seek(seconds) => {
+                    prefetched = None;
                     let seconds = seconds.max(0.0);
                     // 播完之后会话已经丢掉（最后一遍播完就停在这里，切歌由 UI 负责）。
                     // 这时拖动进度条应该重新开流，而不是什么都不发生。
@@ -479,6 +496,7 @@ fn decode_loop(
                     }
                 }
                 Command::Stop => {
+                    prefetched = None;
                     session = None;
                     if let Ok(mut track) = shared.track.lock() {
                         *track = None;
@@ -505,26 +523,42 @@ fn decode_loop(
             continue;
         }
 
-        // —— 3. 解码完毕：等缓冲排空 ——
+        // —— 3. 解码完毕：缓冲里还压着尾巴，趁这段时间把下一首读好 ——
         if active.finished {
+            // 每首只试一次。try 失败就按「队列到头」处理，免得一路跳着报错。
+            if !active.prefetch_attempted {
+                active.prefetch_attempted = true;
+                if let Some(track) = queue.advance_auto() {
+                    match prepare_session(&track, target_rate) {
+                        Ok(prepared) => prefetched = Some((track, prepared)),
+                        Err(error) => shared.set_error(format!("{error:#}")),
+                    }
+                }
+            }
+
+            // 尾巴先补进缓冲（缓冲满时会有残留），然后立刻接上下一首。
+            if !active.pending.is_empty() {
+                let written = producer.push_slice(&active.pending);
+                active.pending.drain(..written);
+            }
+            if let Some((track, prepared)) = prefetched.take()
+                && active.pending.is_empty()
+            {
+                // 关键：缓冲里还压着上一首的尾巴时就换会话，新数据直接跟在后面，
+                // 中间没有静音，也不需要先 flush。
+                session = Some(start_session_seamless(&shared, track, prepared));
+                shared.set_queue_index(queue.current_index());
+                continue;
+            }
+
             if producer.occupied_len() == 0 {
                 let deadline = *active
                     .drain_deadline
                     .get_or_insert_with(|| Instant::now() + Duration::from_millis(80));
                 if Instant::now() >= deadline {
-                    // 队列里还有下一首就由引擎自己接上：UI 不再计算下一首，
-                    // 无缝切轨也才有地方落脚。整条队列放完才算真的 Ended。
-                    match queue.advance_auto() {
-                        Some(track) => {
-                            flush_and_wait(&shared);
-                            session = start_session(&shared, track, target_rate);
-                        }
-                        None => {
-                            shared.mark_finished();
-                            session = None;
-                        }
-                    }
-                    shared.set_queue_index(queue.current_index());
+                    // 队列真的到头了（或者下一首打不开）。
+                    shared.mark_finished();
+                    session = None;
                 }
             } else {
                 active.drain_deadline = None;
@@ -584,40 +618,50 @@ fn decode_loop(
     }
 }
 
-fn start_session(shared: &Arc<Shared>, track: Track, target_rate: u32) -> Option<Session> {
-    shared.begin_load(track.clone());
-
-    let decoder = match decode::open_range(&track.path, target_rate, track.window) {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            shared.set_error(format!("{error:#}"));
-            return None;
-        }
-    };
-
+/// 打开一条解码流，但不碰任何共享状态 —— 给「提前读下一首」用。
+fn prepare_session(track: &Track, target_rate: u32) -> anyhow::Result<Prepared> {
+    let decoder = decode::open_range(&track.path, target_rate, track.window)?;
     let spec = decoder.spec();
     let resampler = if spec.rate != target_rate {
-        match StreamResampler::new(spec.rate, target_rate, spec.channels.max(1) as usize) {
-            Ok(resampler) => Some(resampler),
-            Err(error) => {
-                shared.set_error(format!("{error:#}"));
-                return None;
-            }
-        }
+        Some(StreamResampler::new(
+            spec.rate,
+            target_rate,
+            spec.channels.max(1) as usize,
+        )?)
     } else {
         None
     };
+    Ok(Prepared { decoder, resampler })
+}
 
+fn start_session(shared: &Arc<Shared>, track: Track, target_rate: u32) -> Option<Session> {
+    shared.begin_load(track.clone());
+    match prepare_session(&track, target_rate) {
+        Ok(prepared) => Some(activate(shared, &track, prepared)),
+        Err(error) => {
+            shared.set_error(format!("{error:#}"));
+            None
+        }
+    }
+}
+
+/// 无缝接上已经预读好的下一首：不经过 Loading，输出不会停。
+fn start_session_seamless(shared: &Arc<Shared>, track: Track, prepared: Prepared) -> Session {
+    shared.begin_seamless_load(track.clone());
+    activate(shared, &track, prepared)
+}
+
+fn activate(shared: &Arc<Shared>, track: &Track, prepared: Prepared) -> Session {
     let duration_ms = track.duration.map(|d| d.as_millis() as u64).unwrap_or(0);
-    shared.mark_ready(decoder.backend(), duration_ms);
-
-    Some(Session {
-        decoder,
-        resampler,
+    shared.mark_ready(prepared.decoder.backend(), duration_ms);
+    Session {
+        decoder: prepared.decoder,
+        resampler: prepared.resampler,
         pending: Vec::new(),
         finished: false,
         drain_deadline: None,
-    })
+        prefetch_attempted: false,
+    }
 }
 
 /// 支持的格式清单（给设置页 / 帮助文本用）。
