@@ -87,8 +87,8 @@ pub fn dialog_extensions() -> &'static [&'static str] {
         "mp3", "mp2", "mp1", "mpa", "flac", "wav", "wave", "aiff", "aif", "aifc", "caf", "m4a",
         "m4b", "m4r", "mp4", "alac", "aac", "adts", "ogg", "oga", "mka", "mkv", "webm", "opus",
         "spx", "wma", "asf", "ape", "wv", "tta", "tak", "shn", "mpc", "dsf", "dff", "amr", "awb",
-        "ac3", "eac3", "dts", "dtshd", "ra", "rm", "au", "snd", "voc", "w64", "paf", "svx",
-        "mod", "xm", "s3m", "it", "umx", "nsf", "spc", "vgm", "vgz", "gbs", "avi", "mov", "flv",
-        "wmv", "ts", "m2ts", "mpg", "mpeg", "3gp", "3g2", "ogv",
+        "ac3", "eac3", "dts", "dtshd", "ra", "rm", "au", "snd", "voc", "w64", "paf", "svx", "mod",
+        "xm", "s3m", "it", "umx", "nsf", "spc", "vgm", "vgz", "gbs", "avi", "mov", "flv", "wmv",
+        "ts", "m2ts", "mpg", "mpeg", "3gp", "3g2", "ogv",
     ]
 }

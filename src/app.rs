@@ -4,8 +4,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use gpui_kit::component::*;
-use gpui_kit::{AssetSource, Result as AssetResult, SharedString};
 use gpui_kit::*;
+use gpui_kit::{AssetSource, Result as AssetResult, SharedString};
 
 use crate::ui::PlayerView;
 
@@ -68,7 +68,11 @@ pub fn run() -> anyhow::Result<()> {
                 WindowAppearance::Dark | WindowAppearance::VibrantDark
             );
             Theme::change(
-                if dark { ThemeMode::Dark } else { ThemeMode::Light },
+                if dark {
+                    ThemeMode::Dark
+                } else {
+                    ThemeMode::Light
+                },
                 Some(window),
                 cx,
             );

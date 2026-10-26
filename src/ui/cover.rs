@@ -38,7 +38,10 @@ mod tests {
             image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
         });
         image::DynamicImage::ImageRgba8(image)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .expect("写入 PNG");
         bytes
     }

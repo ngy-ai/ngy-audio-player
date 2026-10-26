@@ -56,12 +56,14 @@ impl StreamResampler {
                 break;
             }
 
-            let input_adapter =
-                match InterleavedSlice::new(&self.pending[consumed..consumed + required], channels, need)
-                {
-                    Ok(adapter) => adapter,
-                    Err(_) => break,
-                };
+            let input_adapter = match InterleavedSlice::new(
+                &self.pending[consumed..consumed + required],
+                channels,
+                need,
+            ) {
+                Ok(adapter) => adapter,
+                Err(_) => break,
+            };
 
             self.out_scratch.resize(capacity * channels, 0.0);
             let mut output_adapter =

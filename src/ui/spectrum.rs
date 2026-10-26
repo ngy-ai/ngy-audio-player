@@ -68,7 +68,12 @@ impl Spectrum {
         let bands = self.levels.len();
         for band in 0..bands {
             let start = self.edges[band];
-            let end = self.edges.get(band + 1).copied().unwrap_or(FFT_SIZE / 2).max(start + 1);
+            let end = self
+                .edges
+                .get(band + 1)
+                .copied()
+                .unwrap_or(FFT_SIZE / 2)
+                .max(start + 1);
             let mut peak = 0.0f32;
             for bin in start..end.min(FFT_SIZE / 2) {
                 peak = peak.max(self.buffer[bin].norm());
