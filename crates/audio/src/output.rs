@@ -58,13 +58,22 @@ pub fn open(shared: &Arc<Shared>) -> anyhow::Result<(cpal::Stream, OutputConfig,
     let producer = ringbuf::Prod::new(ring.clone());
     let consumer = ringbuf::Cons::new(ring);
 
+    // 认不全的格式会让**整个设备**上任何文件都不出声：以前只认 6 种，遇到
+    // 24 位打包或 64 位浮点的设备就直接报错退出。宁可多写几个分支，也不要
+    // 让用户看到「一首也放不了」。
     let stream = match sample_format {
         cpal::SampleFormat::F32 => build::<f32>(&device, config, shared.clone(), consumer),
+        cpal::SampleFormat::F64 => build::<f64>(&device, config, shared.clone(), consumer),
         cpal::SampleFormat::I16 => build::<i16>(&device, config, shared.clone(), consumer),
         cpal::SampleFormat::U16 => build::<u16>(&device, config, shared.clone(), consumer),
         cpal::SampleFormat::I32 => build::<i32>(&device, config, shared.clone(), consumer),
+        cpal::SampleFormat::U32 => build::<u32>(&device, config, shared.clone(), consumer),
+        cpal::SampleFormat::I64 => build::<i64>(&device, config, shared.clone(), consumer),
+        cpal::SampleFormat::U64 => build::<u64>(&device, config, shared.clone(), consumer),
         cpal::SampleFormat::I8 => build::<i8>(&device, config, shared.clone(), consumer),
         cpal::SampleFormat::U8 => build::<u8>(&device, config, shared.clone(), consumer),
+        cpal::SampleFormat::I24 => build::<cpal::I24>(&device, config, shared.clone(), consumer),
+        cpal::SampleFormat::U24 => build::<cpal::U24>(&device, config, shared.clone(), consumer),
         other => bail!("这个设备的采样格式还不支持：{other:?}"),
     }?;
 
