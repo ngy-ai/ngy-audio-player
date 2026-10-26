@@ -620,6 +620,22 @@ fn start_session(shared: &Arc<Shared>, track: Track, target_rate: u32) -> Option
     })
 }
 
+/// 支持的格式清单（给设置页 / 帮助文本用）。
+pub fn supported_formats() -> Vec<&'static str> {
+    crate::format::dialog_extensions().to_vec()
+}
+
+/// 路径 → 占位曲目（读标签在 UI 的后台线程里做）。
+pub fn placeholder_track(path: PathBuf) -> Track {
+    Arc::new(TrackMeta::placeholder(&path))
+}
+
+/// 一个给 UI 用的全局锁：避免同时打开两个 Player 抢设备。
+pub fn player_slot() -> &'static Mutex<()> {
+    static SLOT: Mutex<()> = Mutex::new(());
+    &SLOT
+}
+
 #[cfg(test)]
 mod queue_tests {
     use super::*;
@@ -718,20 +734,4 @@ mod queue_tests {
         assert_eq!(queue.current().unwrap().title, "b");
         assert_eq!(queue.advance_auto().unwrap().title, "c");
     }
-}
-
-/// 支持的格式清单（给设置页 / 帮助文本用）。
-pub fn supported_formats() -> Vec<&'static str> {
-    crate::format::dialog_extensions().to_vec()
-}
-
-/// 路径 → 占位曲目（读标签在 UI 的后台线程里做）。
-pub fn placeholder_track(path: PathBuf) -> Track {
-    Arc::new(TrackMeta::placeholder(&path))
-}
-
-/// 一个给 UI 用的全局锁：避免同时打开两个 Player 抢设备。
-pub fn player_slot() -> &'static Mutex<()> {
-    static SLOT: Mutex<()> = Mutex::new(());
-    &SLOT
 }

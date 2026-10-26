@@ -14,9 +14,11 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use ngy_audio_engine::cue;
+use ngy_audio_engine::engine::same_track;
 use ngy_audio_engine::format;
-use ngy_audio_engine::meta::{CoverArt, TrackMeta};
-use ngy_audio_engine::{PlaybackState, Player, Snapshot};
+use ngy_audio_engine::meta::{CoverArt, TimeWindow, TrackMeta};
+use ngy_audio_engine::{PlaybackState, Player, QueueMode, Repeat, Snapshot};
 
 use super::cover;
 use super::spectrum::Spectrum;
@@ -67,6 +69,14 @@ impl RepeatMode {
             RepeatMode::Off => IconName::RepeatOff,
             RepeatMode::All => IconName::Repeat,
             RepeatMode::One => IconName::Repeat1,
+        }
+    }
+
+    fn to_engine(self) -> Repeat {
+        match self {
+            RepeatMode::Off => Repeat::Off,
+            RepeatMode::All => Repeat::All,
+            RepeatMode::One => Repeat::One,
         }
     }
 }
@@ -135,7 +145,8 @@ pub struct PlayerView {
     cover_for: Option<PathBuf>,
 
     repeat: RepeatMode,
-    last_finished: u64,
+    /// 随机播放是独立开关：随机 × 循环才有完整语义。
+    shuffle: bool,
     has_ffmpeg: bool,
     dark: bool,
     /// 一次性提示（例如「这个格式需要 ffmpeg」），过几秒自动消失。
@@ -270,7 +281,7 @@ impl PlayerView {
             cover: None,
             cover_for: None,
             repeat: RepeatMode::All,
-            last_finished: 0,
+            shuffle: false,
             has_ffmpeg: ngy_audio_engine::has_ffmpeg(),
             dark,
             notice: None,
@@ -357,10 +368,20 @@ impl PlayerView {
             });
         }
 
-        // 自动下一首。
-        if snapshot.finished_serial != self.last_finished {
-            self.last_finished = snapshot.finished_serial;
-            self.on_finished(window, cx);
+        // 引擎说在播哪一首就显示哪一首：自动切歌、上一首 / 下一首、点行播放
+        // 最后都落到这里。UI 不再自己算下一首，只跟着引擎的权威结果走。
+        let playing = snapshot.track.clone();
+        let switched = match (&playing, &self.playing) {
+            (Some(track), Some(current)) => !same_track(current, track),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if switched && let Some(track) = playing {
+            self.playing = Some(track.clone());
+            self.load_cover(&track, cx);
+            self.progress.update(cx, |state, cx| {
+                state.set_value(0.0, window, cx);
+            });
         }
 
         self.snapshot = Some(snapshot);
@@ -379,7 +400,7 @@ impl PlayerView {
         let playing = self.playing.as_ref()?;
         self.active_tracks()
             .iter()
-            .position(|track| track.path == playing.path)
+            .position(|track| same_track(track, playing))
     }
 
     /// 进度条能不能拖动：得真有一首曲子装进了解码器，而且知道总时长。
@@ -390,49 +411,18 @@ impl PlayerView {
         snapshot_can_seek(self.snapshot.as_ref())
     }
 
-    fn on_finished(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.repeat {
-            // 单曲循环直接重载同一首：此时它可能已经被移出列表，不能靠下标找。
-            RepeatMode::One => {
-                if let Some(track) = self.playing.clone() {
-                    self.play_track(track, window, cx);
-                }
-            }
-            RepeatMode::All => {
-                let count = self.active_tracks().len();
-                if count > 0 {
-                    let next = self
-                        .current_index()
-                        .map(|index| (index + 1) % count)
-                        .unwrap_or(0);
-                    self.play_index(next, window, cx);
-                }
-            }
-            RepeatMode::Off => {
-                let Some(index) = self.current_index() else {
-                    return;
-                };
-                if index + 1 < self.active_tracks().len() {
-                    self.play_index(index + 1, window, cx);
-                }
-            }
-        }
-    }
-
+    /// 把整条列表交给引擎当队列，并从 `index` 开播。
+    ///
+    /// 「下一首是谁」由引擎决定，UI 只负责按列表顺序提供候选。
     fn play_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(track) = self.active_tracks().get(index).cloned() else {
             return;
         };
-        self.play_track(track, window, cx);
-    }
-
-    fn play_track(&mut self, track: Arc<TrackMeta>, window: &mut Window, cx: &mut Context<Self>) {
         self.playing = Some(track.clone());
         self.scrubbing = false;
         self.seek_pending = None;
         if let Some(player) = &self.player {
-            player.load(track.clone());
-            player.set_paused(false);
+            player.play(self.active_tracks().to_vec(), index);
         }
         self.load_cover(&track, cx);
         self.notice = None;
@@ -443,13 +433,44 @@ impl PlayerView {
     }
 
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.active_tracks().len();
-        if count == 0 {
+        if self.active_tracks().is_empty() {
             return;
         }
-        let current = self.current_index().unwrap_or(0) as isize;
-        let next = (current + delta).rem_euclid(count as isize);
-        self.play_index(next as usize, window, cx);
+        // 还没开始播时按「下一首」就是从头开始，按「上一首」从末尾开始。
+        if self.playing.is_none() {
+            let index = if delta < 0 {
+                self.active_tracks().len() - 1
+            } else {
+                0
+            };
+            self.play_index(index, window, cx);
+            return;
+        }
+        let Some(player) = &self.player else {
+            return;
+        };
+        self.scrubbing = false;
+        self.seek_pending = None;
+        if delta < 0 {
+            player.prev();
+        } else {
+            player.next();
+        }
+        cx.notify();
+    }
+
+    /// 列表增删 / 重排之后同步给引擎。
+    fn sync_queue(&self) {
+        if let Some(player) = &self.player {
+            player.set_queue(self.active_tracks().to_vec());
+        }
+    }
+
+    fn mode(&self) -> QueueMode {
+        QueueMode {
+            repeat: self.repeat.to_engine(),
+            shuffle: self.shuffle,
+        }
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
@@ -511,7 +532,14 @@ impl PlayerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut paths: Vec<PathBuf> = paths
+        // .cue 不是音频文件而是一张分轨表：展开成多条曲目再入列表。
+        let (cues, audio): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|path| cue::is_cue_path(path));
+        if !cues.is_empty() {
+            self.add_cue_sheets(cues, play_first, window, cx);
+        }
+
+        let mut paths: Vec<PathBuf> = audio
             .into_iter()
             .filter(|path| format::is_audio_path(path))
             .collect();
@@ -570,7 +598,12 @@ impl PlayerView {
                 .iter()
                 .map(|path| Arc::new(TrackMeta::placeholder(path))),
         );
-        self.probe_tracks(list_id, paths.clone(), cx);
+        self.probe_tracks(
+            list_id,
+            paths.iter().map(|path| (path.clone(), None)).collect(),
+            cx,
+        );
+        self.sync_queue();
         // 路径已经定了，标签只是展示信息：先落盘，「退出后列表还在」不依赖探测。
         self.save_library();
 
@@ -588,40 +621,124 @@ impl PlayerView {
         }
     }
 
+    /// 展开 cue 分轨表。要读一次整轨标签（最后一首的终点靠它），放后台跑。
+    fn add_cue_sheets(
+        &mut self,
+        cues: Vec<PathBuf>,
+        play_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            let mut tracks = Vec::new();
+            for cue in cues {
+                match cue::expand(&cue) {
+                    Ok(mut expanded) => tracks.append(&mut expanded),
+                    Err(error) => eprintln!("[cue] {}: {error:#}", cue.display()),
+                }
+            }
+            tracks
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let tracks = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.insert_tracks(tracks, play_first, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 把已经带着完整元数据（含时间窗）的曲目直接放进列表。
+    fn insert_tracks(
+        &mut self,
+        metas: Vec<TrackMeta>,
+        play_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if metas.is_empty() {
+            self.notice = Some(("这张 cue 里没有可用的分轨".into(), Instant::now()));
+            cx.notify();
+            return;
+        }
+
+        let mut seen: HashSet<String> = self
+            .active_tracks()
+            .iter()
+            .map(|track| track_key(track))
+            .collect();
+        let start = self.playlists[self.active].tracks.len();
+        let mut added = 0usize;
+        for meta in metas {
+            if seen.insert(track_key(&meta)) {
+                self.playlists[self.active].tracks.push(Arc::new(meta));
+                added += 1;
+            }
+        }
+        if added == 0 {
+            self.notice = Some(("这些分轨已经在列表里了".into(), Instant::now()));
+            cx.notify();
+            return;
+        }
+
+        self.sync_queue();
+        self.save_library();
+        if play_first || self.playing.is_none() {
+            self.play_index(start, window, cx);
+        } else {
+            self.notice = Some((format!("已加入 {added} 首分轨"), Instant::now()));
+            cx.notify();
+        }
+    }
+
     /// 后台读标签，回来后按「列表 id + 路径」回填。
     ///
     /// 用 id 而不是下标：用户中途重排、删歌、切列表都不会写错位置。刚启动恢复
     /// 播放列表时也走这条路——先把路径铺进列表，标签晚几百毫秒出现没关系。
-    fn probe_tracks(&mut self, list_id: u64, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if paths.is_empty() {
+    fn probe_tracks(
+        &mut self,
+        list_id: u64,
+        entries: Vec<(PathBuf, Option<TimeWindow>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if entries.is_empty() {
             return;
         }
         let task = cx.background_executor().spawn(async move {
-            paths
+            entries
                 .into_iter()
-                .map(|path| Arc::new(TrackMeta::probe(&path)))
+                .map(|(path, window)| {
+                    Arc::new(match window {
+                        Some(window) => TrackMeta::probe_window(&path, window),
+                        None => TrackMeta::probe(&path),
+                    })
+                })
                 .collect::<Vec<_>>()
         });
         cx.spawn(async move |this, cx| {
             let metas = task.await;
             let _ = this.update(cx, |this, cx| {
-                let playing_path = this.playing.as_ref().map(|track| track.path.clone());
+                let playing = this.playing.clone();
                 let updated = this
                     .playlists
                     .iter_mut()
                     .find(|list| list.id == list_id)
                     .and_then(|list| {
                         for meta in metas {
-                            if let Some(slot) =
-                                list.tracks.iter_mut().find(|track| track.path == meta.path)
+                            // 分轨曲目的路径相同，必须连时间窗一起比，否则整张碟
+                            // 会被同一个标签覆盖成同名曲目。
+                            if let Some(slot) = list
+                                .tracks
+                                .iter_mut()
+                                .find(|track| same_track(track, &meta))
                             {
                                 *slot = meta;
                             }
                         }
-                        let playing_path = playing_path?;
+                        let playing = playing?;
                         list.tracks
                             .iter()
-                            .find(|track| track.path == playing_path)
+                            .find(|track| same_track(track, &playing))
                             .cloned()
                     });
 
@@ -632,7 +749,7 @@ impl PlayerView {
                     && this
                         .playing
                         .as_ref()
-                        .is_some_and(|playing| playing.path == track.path)
+                        .is_some_and(|playing| same_track(playing, &track))
                 {
                     // 引擎里存的可能还是占位曲目（没有时长），把真实标签补进去，
                     // 否则进度条算不出比例、总时长显示 0:00。
@@ -729,10 +846,11 @@ impl PlayerView {
             return;
         };
         self.playlists[self.active].tracks.remove(index);
+        self.sync_queue();
         if self
             .playing
             .as_ref()
-            .is_some_and(|playing| playing.path == track.path)
+            .is_some_and(|playing| same_track(playing, &track))
         {
             self.playing = None;
             self.cover = None;
@@ -767,6 +885,7 @@ impl PlayerView {
         }
         let track = tracks.remove(from);
         tracks.insert(to, track);
+        self.sync_queue();
         self.save_library();
         cx.notify();
     }
@@ -788,6 +907,7 @@ impl PlayerView {
         });
         self.active = self.playlists.len() - 1;
         self.notice = Some((format!("已新建「{name}」"), Instant::now()));
+        self.sync_queue();
         self.save_library();
         cx.notify();
     }
@@ -817,6 +937,7 @@ impl PlayerView {
         }
         self.active = index;
         self.notice = None;
+        self.sync_queue();
         self.save_library();
         cx.notify();
     }
@@ -833,6 +954,7 @@ impl PlayerView {
         } else if index < self.active {
             self.active -= 1;
         }
+        self.sync_queue();
         self.save_library();
         cx.notify();
     }
@@ -985,19 +1107,24 @@ impl PlayerView {
             .playlists
             .into_iter()
             .enumerate()
-            .map(|(index, (name, paths))| Playlist {
+            .map(|(index, (name, entries))| Playlist {
                 id: index as u64 + 1,
                 name,
-                tracks: paths
+                tracks: entries
                     .iter()
-                    .map(|path| Arc::new(TrackMeta::placeholder(path)))
+                    .map(|entry| {
+                        Arc::new(match entry.window {
+                            Some(window) => TrackMeta::placeholder_window(&entry.path, window),
+                            None => TrackMeta::placeholder(&entry.path),
+                        })
+                    })
                     .collect(),
             })
             .collect();
         self.next_playlist_id = self.playlists.len() as u64 + 1;
         self.active = saved.active.min(self.playlists.len() - 1);
 
-        let probes: Vec<(u64, Vec<PathBuf>)> = self
+        let probes: Vec<(u64, Vec<ProbeEntry>)> = self
             .playlists
             .iter()
             .map(|playlist| {
@@ -1006,14 +1133,15 @@ impl PlayerView {
                     playlist
                         .tracks
                         .iter()
-                        .map(|track| track.path.clone())
+                        .map(|track| (track.path.clone(), track.window))
                         .collect(),
                 )
             })
             .collect();
-        for (list_id, paths) in probes {
-            self.probe_tracks(list_id, paths, cx);
+        for (list_id, entries) in probes {
+            self.probe_tracks(list_id, entries, cx);
         }
+        self.sync_queue();
     }
 }
 
@@ -1029,16 +1157,39 @@ fn path_key(path: &Path) -> String {
     }
 }
 
+/// 待探测的一条曲目：路径，以及分轨的时间窗（整轨为 `None`）。
+type ProbeEntry = (PathBuf, Option<TimeWindow>);
+
+/// 曲目的去重键：路径 + 时间窗。分轨曲目共用同一个文件，只比路径会把整张碟当重复。
+fn track_key(track: &TrackMeta) -> String {
+    match track.window {
+        Some(window) => format!(
+            "{}\u{1}{}\u{1}{}",
+            path_key(&track.path),
+            window.start.as_millis(),
+            window.end.as_millis()
+        ),
+        None => path_key(&track.path),
+    }
+}
+
 // —— 播放列表持久化 ——
 //
 // 只存「列表名 + 文件路径」：标题、时长、封面都能从文件重新读出来，存下来反而
 // 会在换机器 / 改标签之后变成假信息。格式是带转义的制表符文本，够简单、出问题
 // 时还能用文本编辑器看一眼。
 
+/// 磁盘上的一条曲目。分轨曲目要连时间窗一起存，否则重启之后整张碟会变回一条。
+#[derive(Debug, PartialEq)]
+struct SavedTrack {
+    path: PathBuf,
+    window: Option<TimeWindow>,
+}
+
 /// 磁盘上的一份播放列表。
 struct SavedLibrary {
     active: usize,
-    playlists: Vec<(String, Vec<PathBuf>)>,
+    playlists: Vec<(String, Vec<SavedTrack>)>,
 }
 
 /// 配置文件位置。单元测试里返回 `None`：测试不该读写用户真实的配置目录。
@@ -1111,7 +1262,7 @@ fn unescape_field(text: &str) -> String {
 }
 
 fn serialize_library(playlists: &[Playlist], active: usize) -> String {
-    let mut text = String::from("# 声波播放列表（自动生成，手动改需要保持这个格式）\nversion 1\n");
+    let mut text = String::from("# 声波播放列表（自动生成，手动改需要保持这个格式）\nversion 2\n");
     text.push_str(&format!("active {active}\n"));
     for playlist in playlists {
         text.push_str("list\t");
@@ -1120,6 +1271,13 @@ fn serialize_library(playlists: &[Playlist], active: usize) -> String {
         for track in &playlist.tracks {
             text.push_str("track\t");
             text.push_str(&escape_field(&track.path.to_string_lossy()));
+            // 整轨曲目只写路径（和 version 1 一样），分轨才追加起止毫秒。
+            if let Some(window) = track.window {
+                text.push('\t');
+                text.push_str(&window.start.as_millis().to_string());
+                text.push('\t');
+                text.push_str(&window.end.as_millis().to_string());
+            }
             text.push('\n');
         }
     }
@@ -1128,7 +1286,7 @@ fn serialize_library(playlists: &[Playlist], active: usize) -> String {
 
 fn parse_library(text: &str) -> Option<SavedLibrary> {
     let mut active = 0usize;
-    let mut playlists: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    let mut playlists: Vec<(String, Vec<SavedTrack>)> = Vec::new();
 
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
@@ -1143,8 +1301,19 @@ fn parse_library(text: &str) -> Option<SavedLibrary> {
             if value.is_empty() {
                 continue;
             }
+            let mut fields = value.split('\t');
+            let path = PathBuf::from(unescape_field(fields.next().unwrap_or_default()));
+            let start = fields.next().and_then(|text| text.parse::<u64>().ok());
+            let end = fields.next().and_then(|text| text.parse::<u64>().ok());
+            let window = match (start, end) {
+                (Some(start), Some(end)) if end > start => Some(TimeWindow {
+                    start: Duration::from_millis(start),
+                    end: Duration::from_millis(end),
+                }),
+                _ => None,
+            };
             if let Some((_, tracks)) = playlists.last_mut() {
-                tracks.push(PathBuf::from(unescape_field(value)));
+                tracks.push(SavedTrack { path, window });
             }
         }
     }
@@ -1913,6 +2082,30 @@ impl Render for PlayerView {
         root = root.child(body);
 
         // —— 底部传输控制 ——
+        // 随机是独立开关：开着的时候用主色，否则关掉了也看不出来。
+        let shuffle_button = {
+            let button = Button::new("shuffle")
+                .ghost()
+                .small()
+                .icon(IconName::Shuffle)
+                .tooltip(if self.shuffle {
+                    "随机播放：开"
+                } else {
+                    "随机播放：关"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.shuffle = !this.shuffle;
+                    if let Some(player) = &this.player {
+                        player.set_mode(this.mode());
+                    }
+                    cx.notify();
+                }));
+            if self.shuffle {
+                button.primary()
+            } else {
+                button
+            }
+        };
         let controls = h_flex()
             .gap_1()
             .px_2()
@@ -1944,6 +2137,7 @@ impl Render for PlayerView {
                     .icon(IconName::SkipForward)
                     .on_click(cx.listener(|this, _, window, cx| this.step(1, window, cx))),
             )
+            .child(shuffle_button)
             .child(
                 Button::new("repeat")
                     .ghost()
@@ -1952,6 +2146,9 @@ impl Render for PlayerView {
                     .tooltip(self.repeat.label())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.repeat = this.repeat.next();
+                        if let Some(player) = &this.player {
+                            player.set_mode(this.mode());
+                        }
                         cx.notify();
                     })),
             );
@@ -2369,6 +2566,8 @@ mod tests {
             track: None,
             finished_serial: 0,
             device: String::new(),
+            queue_index: None,
+            mode: QueueMode::default(),
         };
 
         assert!(!snapshot_can_seek(None), "还没装载曲目时不能拖进度");
@@ -2835,12 +3034,37 @@ mod tests {
         assert_eq!(
             saved.playlists[0].1,
             vec![
-                PathBuf::from(r"C:\音乐\一 - 二.flac"),
-                PathBuf::from("/tmp/三.mp3")
+                SavedTrack {
+                    path: PathBuf::from(r"C:\音乐\一 - 二.flac"),
+                    window: None,
+                },
+                SavedTrack {
+                    path: PathBuf::from("/tmp/三.mp3"),
+                    window: None,
+                }
             ]
         );
         assert_eq!(saved.playlists[1].0, "空列表");
         assert!(saved.playlists[1].1.is_empty());
+    }
+
+    #[test]
+    fn library_keeps_cue_time_windows() {
+        let window = TimeWindow {
+            start: Duration::from_millis(1_000),
+            end: Duration::from_millis(2_500),
+        };
+        let mut meta = TrackMeta::placeholder(Path::new("/tmp/album.flac"));
+        meta.window = Some(window);
+        meta.duration = Some(window.len());
+        let playlists = vec![Playlist {
+            id: 1,
+            name: "整轨".into(),
+            tracks: vec![Arc::new(meta)],
+        }];
+
+        let saved = parse_library(&serialize_library(&playlists, 0)).expect("应当能解回来");
+        assert_eq!(saved.playlists[0].1[0].window, Some(window));
     }
 
     #[test]

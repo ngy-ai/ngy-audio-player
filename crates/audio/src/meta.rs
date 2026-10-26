@@ -89,6 +89,14 @@ impl TrackMeta {
         }
     }
 
+    /// 占位曲目 + 时间窗：从磁盘恢复列表时用，不读标签。
+    pub fn placeholder_window(path: &Path, window: TimeWindow) -> Self {
+        let mut meta = Self::placeholder(path);
+        meta.window = Some(window);
+        meta.duration = Some(window.len());
+        meta
+    }
+
     /// 读标签，然后把这条曲目钉在整轨的某一段时间上。
     ///
     /// 时长必须换成窗口长度：整轨的时长写进进度条会让分轨「一打开就播完了」。
