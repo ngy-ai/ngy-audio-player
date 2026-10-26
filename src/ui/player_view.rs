@@ -349,12 +349,14 @@ impl PlayerView {
         }
 
         // 频谱：有声音才算，静音时让柱子自己落下去。
+        let previous_levels = self.levels.clone();
         let samples = player.spectrum();
         if samples.is_empty() {
             self.levels = self.spectrum.silence().to_vec();
         } else {
             self.levels = self.spectrum.update(&samples).to_vec();
         }
+        let levels_changed = previous_levels != self.levels;
 
         // 进度滑块：用户没在拖的时候才跟随播放位置。
         if !self.scrubbing {
@@ -384,8 +386,25 @@ impl PlayerView {
             });
         }
 
+        // 暂停 / 播完 / 空闲时位置不再变化，没必要每 80ms 重建整棵元素树：
+        // 列表越长，这次 notify 越贵。播放中照常每 tick 刷新（进度条 + 频谱）。
+        let quiet = matches!(
+            snapshot.state,
+            PlaybackState::Idle | PlaybackState::Paused | PlaybackState::Ended
+        );
+        let moved = self.snapshot.as_ref().is_none_or(|old| {
+            old.state != snapshot.state
+                || old.queue_index != snapshot.queue_index
+                || old.error != snapshot.error
+                || (old.position - snapshot.position).abs() > 0.01
+                || (old.duration - snapshot.duration).abs() > 0.01
+                || (old.volume - snapshot.volume).abs() > 0.001
+        });
+
         self.snapshot = Some(snapshot);
-        cx.notify();
+        if !quiet || moved || levels_changed {
+            cx.notify();
+        }
     }
 
     fn active_tracks(&self) -> &[Arc<TrackMeta>] {
