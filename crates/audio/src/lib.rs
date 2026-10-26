@@ -23,7 +23,7 @@ pub mod state;
 pub use decode::{Backend, Decoder, StreamSpec};
 pub use engine::{Player, Track, placeholder_track};
 pub use meta::{CoverArt, TimeWindow, TrackMeta};
-pub use state::{PlaybackState, Snapshot};
+pub use state::{PlaybackState, QueueMode, Repeat, Snapshot};
 
 /// 这个构建能播的格式（扩展名列表）。
 pub fn supported_extensions() -> &'static [&'static str] {

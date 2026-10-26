@@ -6,6 +6,43 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, O
 use crate::decode::Backend;
 use crate::meta::TrackMeta;
 
+/// 队列播到末尾之后怎么办。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Repeat {
+    /// 播完最后一首就停。
+    #[default]
+    Off,
+    /// 回到队列开头继续。
+    All,
+    /// 同一首反复播。
+    One,
+}
+
+impl Repeat {
+    fn code(self) -> u8 {
+        match self {
+            Repeat::Off => 0,
+            Repeat::All => 1,
+            Repeat::One => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Repeat::All,
+            2 => Repeat::One,
+            _ => Repeat::Off,
+        }
+    }
+}
+
+/// 队列的播放方式。随机是一个开关而不是第四种循环：随机 × 循环才有完整语义。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueMode {
+    pub repeat: Repeat,
+    pub shuffle: bool,
+}
+
 /// UI 侧看到的状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackState {
@@ -39,9 +76,12 @@ pub struct Snapshot {
     pub backend: Option<Backend>,
     pub error: Option<String>,
     pub track: Option<std::sync::Arc<TrackMeta>>,
-    /// 「又播完一首」的序号：UI 比对它来触发自动下一首。
+    /// 整条队列播完的序号。队列里还有下一首时引擎会自己接上，不会加这个数。
     pub finished_serial: u64,
     pub device: String,
+    /// 当前曲目在队列里的下标（队列的原始顺序，不是播放顺序）。
+    pub queue_index: Option<usize>,
+    pub mode: QueueMode,
 }
 
 pub struct Shared {
@@ -65,6 +105,11 @@ pub struct Shared {
     pub volume_bits: AtomicU32,
     /// 曲目播完的序号。
     pub finished_serial: AtomicU64,
+    /// 当前曲目在队列里的下标；`u64::MAX` 表示没有。
+    queue_index: AtomicU64,
+    /// 循环方式，见 `Repeat::code`。
+    repeat: AtomicU8,
+    shuffle: AtomicBool,
     /// 要求音频回调把队列里剩下的旧数据丢掉（seek / 切歌时用）。
     pub flush: AtomicBool,
 
@@ -97,6 +142,9 @@ impl Shared {
             duration_ms: AtomicU64::new(0),
             volume_bits: AtomicU32::new(0.8f32.to_bits()),
             finished_serial: AtomicU64::new(0),
+            queue_index: AtomicU64::new(u64::MAX),
+            repeat: AtomicU8::new(0),
+            shuffle: AtomicBool::new(false),
             flush: AtomicBool::new(false),
             rate: AtomicU32::new(48_000),
             out_channels: AtomicU16::new(2),
@@ -126,6 +174,30 @@ impl Shared {
         self.active.load(Ordering::Relaxed)
             && !self.paused.load(Ordering::Relaxed)
             && !self.loading.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mode(&self, mode: QueueMode) {
+        self.repeat.store(mode.repeat.code(), Ordering::Relaxed);
+        self.shuffle.store(mode.shuffle, Ordering::Relaxed);
+    }
+
+    pub fn mode(&self) -> QueueMode {
+        QueueMode {
+            repeat: Repeat::from_code(self.repeat.load(Ordering::Relaxed)),
+            shuffle: self.shuffle.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn set_queue_index(&self, index: Option<usize>) {
+        let value = index.map(|index| index as u64).unwrap_or(u64::MAX);
+        self.queue_index.store(value, Ordering::Relaxed);
+    }
+
+    fn queue_index(&self) -> Option<usize> {
+        match self.queue_index.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            value => Some(value as usize),
+        }
     }
 
     pub fn volume(&self) -> f32 {
@@ -208,6 +280,8 @@ impl Shared {
             track,
             finished_serial: self.finished_serial.load(Ordering::Relaxed),
             device: self.device_name(),
+            queue_index: self.queue_index(),
+            mode: self.mode(),
         }
     }
 
