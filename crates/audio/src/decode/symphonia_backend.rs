@@ -20,6 +20,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Duration as UnitsDuration, Time};
 
 use super::{Backend, Decoder, StreamSpec, to_stereo};
+use crate::meta::TimeWindow;
 
 /// 末尾留的余量。几个解码器在精确末帧 seek 会报 EOF / out-of-range，
 /// 而标签探测出的时长又常比容器真实帧数长几毫秒到几十毫秒。
@@ -38,9 +39,15 @@ pub struct SymphoniaDecoder {
     seek_end: Option<Duration>,
     /// 打开时试解出来的第一块，不能丢。
     primer: Option<Vec<f32>>,
+    /// 分轨：这条流在文件里的起点。对外的时间轴从 0 开始。
+    prefix: Duration,
+    /// 分轨：播到这里就结束（文件内绝对时间）。`None` 表示播到文件尾。
+    limit: Option<Duration>,
+    /// 从 `prefix` 起已交出的帧数，用来判断有没有越过 `limit`。
+    decoded_frames: u64,
 }
 
-pub fn open(path: &Path) -> anyhow::Result<Box<dyn Decoder>> {
+pub fn open(path: &Path, window: Option<TimeWindow>) -> anyhow::Result<Box<dyn Decoder>> {
     let file = File::open(path).with_context(|| format!("打不开文件：{}", path.display()))?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -101,7 +108,18 @@ pub fn open(path: &Path) -> anyhow::Result<Box<dyn Decoder>> {
         stereo: Vec::new(),
         seek_end,
         primer: None,
+        prefix: window.map(|window| window.start).unwrap_or_default(),
+        limit: window.map(|window| window.end),
+        decoded_frames: 0,
     };
+
+    // 分轨的起点在文件中间：先跳过去，再试解。试解的那块必须是新位置的，
+    // 否则整轨的开头会被当成这一首的开头。
+    if !decoder.prefix.is_zero() {
+        decoder
+            .seek_in_file(decoder.prefix)
+            .context("分轨起点超出文件范围")?;
+    }
 
     // 试解一块再算成功。Symphonia 对裸 MPEG 音频（mp3 / ADTS）的探测非常宽松，
     // 任意二进制都可能被判成「音频流」——真解出样本才算这个文件能播。
@@ -114,6 +132,53 @@ pub fn open(path: &Path) -> anyhow::Result<Box<dyn Decoder>> {
     Ok(Box::new(decoder))
 }
 
+impl SymphoniaDecoder {
+    /// 从 `prefix` 起已经解出多少音频。
+    fn elapsed(&self) -> Duration {
+        Duration::from_secs_f64(self.decoded_frames as f64 / self.spec.rate.max(1) as f64)
+    }
+
+    fn reached_limit(&self) -> bool {
+        match self.limit {
+            Some(limit) => self.prefix + self.elapsed() >= limit,
+            None => false,
+        }
+    }
+
+    /// 这一块最多能留多少个样本（窗口末尾之后的属于下一首）。
+    fn keep_samples(&self) -> Option<usize> {
+        let limit = self.limit?;
+        let played = self.prefix + self.elapsed();
+        let remaining = limit.saturating_sub(played).as_secs_f64();
+        Some((remaining * self.spec.rate.max(1) as f64).round() as usize * 2)
+    }
+
+    fn seek_in_file(&mut self, to: Duration) -> anyhow::Result<()> {
+        // 标签/ffprobe 报的时长可能比容器真实帧数长（编码器延迟、尾部 padding
+        // 都算进去了）。直接拿它 seek 到最右边，Symphonia 会判 out-of-range。
+        // 这里按容器自己的帧数收一收，并给末帧留点余量。
+        let to = match self.seek_end {
+            Some(end) => to.min(end.saturating_sub(SEEK_END_MARGIN)),
+            None => to,
+        };
+        let time = Time::try_new(to.as_secs() as i64, to.subsec_nanos())
+            .context("seek 目标超出可表示范围")?;
+        self.reader.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(self.track_id),
+            },
+        )?;
+        // seek 之后解码器状态与新的包不连续，必须 reset；打开时试解的那块
+        // 属于旧位置，也必须丢掉，否则会先响一下开头。
+        self.decoder.reset();
+        self.primer = None;
+        self.decoded_frames = 0;
+        Ok(())
+    }
+}
+
 impl Decoder for SymphoniaDecoder {
     fn backend(&self) -> Backend {
         Backend::Symphonia
@@ -124,10 +189,16 @@ impl Decoder for SymphoniaDecoder {
     }
 
     fn next_chunk(&mut self) -> anyhow::Result<Option<Vec<f32>>> {
+        // 试解的那块在 `open` 里已经按窗口截过、也推进过帧数了，这里原样交出：
+        // 再截一次、再计一次，会把「已播时长」算成两倍，窗口就会提前结束。
         if let Some(chunk) = self.primer.take() {
             return Ok(Some(chunk));
         }
         loop {
+            // 分轨已经播到窗口末尾：别再去读文件，读出来也只会被丢掉。
+            if self.reached_limit() {
+                return Ok(None);
+            }
             let packet = match self.reader.next_packet() {
                 Ok(Some(packet)) => packet,
                 Ok(None) => return Ok(None),
@@ -152,6 +223,15 @@ impl Decoder for SymphoniaDecoder {
                     if self.stereo.is_empty() {
                         continue;
                     }
+                    if let Some(keep) = self.keep_samples()
+                        && self.stereo.len() > keep
+                    {
+                        self.stereo.truncate(keep);
+                    }
+                    if self.stereo.is_empty() {
+                        return Ok(None);
+                    }
+                    self.decoded_frames += (self.stereo.len() / 2) as u64;
                     return Ok(Some(std::mem::take(&mut self.stereo)));
                 }
                 // 单个包坏掉不影响整首歌，丢掉继续。
@@ -171,27 +251,8 @@ impl Decoder for SymphoniaDecoder {
     }
 
     fn seek(&mut self, to: Duration) -> anyhow::Result<()> {
-        // 标签/ffprobe 报的时长可能比容器真实帧数长（编码器延迟、尾部 padding
-        // 都算进去了）。直接拿它 seek 到最右边，Symphonia 会判 out-of-range。
-        // 这里按容器自己的帧数收一收，并给末帧留点余量。
-        let to = match self.seek_end {
-            Some(end) => to.min(end.saturating_sub(SEEK_END_MARGIN)),
-            None => to,
-        };
-        let time = Time::try_new(to.as_secs() as i64, to.subsec_nanos())
-            .context("seek 目标超出可表示范围")?;
-        self.reader.seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time,
-                track_id: Some(self.track_id),
-            },
-        )?;
-        // seek 之后解码器状态与新的包不连续，必须 reset；打开时试解的那块
-        // 属于旧位置，也必须丢掉，否则会先响一下开头。
-        self.decoder.reset();
-        self.primer = None;
-        Ok(())
+        // 对外是窗口内时间，落到文件里要加回分轨起点。
+        self.seek_in_file(self.prefix + to)
     }
 }
 

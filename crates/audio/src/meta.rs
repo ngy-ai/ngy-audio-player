@@ -21,10 +21,34 @@ impl std::fmt::Debug for CoverArt {
     }
 }
 
+/// 曲目在整轨文件里的时间窗（CUE 分轨）。
+///
+/// 引擎与解码器对外看到的时间轴始终是「窗口内的 0..len」：分轨的进度条从 0
+/// 开始、总时长是这一首的长度，而不是整轨的长度。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimeWindow {
+    /// 在文件里的起点。
+    pub start: Duration,
+    /// 在文件里的终点。
+    pub end: Duration,
+}
+
+impl TimeWindow {
+    pub fn len(&self) -> Duration {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len().is_zero()
+    }
+}
+
 /// 一首曲子的全部展示信息。
 #[derive(Clone, Debug)]
 pub struct TrackMeta {
     pub path: PathBuf,
+    /// 有值表示这一条是从整轨里切出来的分轨。
+    pub window: Option<TimeWindow>,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -51,6 +75,7 @@ impl TrackMeta {
         };
         Self {
             path: path.to_path_buf(),
+            window: None,
             title,
             artist,
             album: String::new(),
@@ -62,6 +87,34 @@ impl TrackMeta {
             format: format::label_for(path),
             cover: None,
         }
+    }
+
+    /// 读标签，然后把这条曲目钉在整轨的某一段时间上。
+    ///
+    /// 时长必须换成窗口长度：整轨的时长写进进度条会让分轨「一打开就播完了」。
+    pub fn probe_window(path: &Path, window: TimeWindow) -> Self {
+        let mut meta = Self::probe(path);
+        meta.window = Some(window);
+        meta.duration = Some(window.len());
+        meta
+    }
+
+    /// 整轨里的一首分轨。文件级标签先读，再用 CUE 里写的标题 / 艺人覆盖：
+    /// 整轨文件的标签描述的是整张碟，CUE 里的才是「这首是谁唱的」。
+    pub fn from_cue(
+        path: &Path,
+        window: TimeWindow,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> Self {
+        let mut meta = Self::probe_window(path, window);
+        if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+            meta.title = title.to_string();
+        }
+        if let Some(artist) = artist.map(str::trim).filter(|artist| !artist.is_empty()) {
+            meta.artist = artist.to_string();
+        }
+        meta
     }
 
     /// 读标签与音频参数。任何一步失败都只是少一点信息，不视为错误。
@@ -88,10 +141,7 @@ impl TrackMeta {
             meta.duration = ffprobe_duration(path);
         }
 
-        if let Some(tag) = tagged
-            .primary_tag()
-            .or_else(|| tagged.first_tag())
-        {
+        if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
             use lofty::tag::Accessor as _;
             if let Some(title) = tag.title().filter(|t| !t.trim().is_empty()) {
                 meta.title = title.trim().to_string();

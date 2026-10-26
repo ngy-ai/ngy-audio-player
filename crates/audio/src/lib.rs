@@ -11,6 +11,7 @@
 //! 这个 crate **不依赖 GPUI**：它可以在没有任何界面的情况下被测试和复用
 //! （命令行播放器、集成测试都直接用它）。
 
+pub mod cue;
 pub mod decode;
 pub mod engine;
 pub mod format;
@@ -21,7 +22,7 @@ pub mod state;
 
 pub use decode::{Backend, Decoder, StreamSpec};
 pub use engine::{Player, Track, placeholder_track};
-pub use meta::{CoverArt, TrackMeta};
+pub use meta::{CoverArt, TimeWindow, TrackMeta};
 pub use state::{PlaybackState, Snapshot};
 
 /// 这个构建能播的格式（扩展名列表）。

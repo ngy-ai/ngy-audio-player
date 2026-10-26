@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 
 use super::{Backend, Decoder, StreamSpec};
+use crate::meta::TimeWindow;
 
 /// 每次向 ffmpeg 要多少帧。4096 帧 ≈ 85ms@48k，既够大（系统调用少）又够小（seek 响应快）。
 const CHUNK_FRAMES: usize = 4096;
@@ -43,7 +44,11 @@ pub fn ffmpeg_path() -> Option<&'static Path> {
             // 常见的「装了但没进 PATH」位置。
             #[cfg(windows)]
             {
-                for base in ["C:/ffmpeg/bin", "C:/Program Files/ffmpeg/bin", "D:/ffmpeg/bin"] {
+                for base in [
+                    "C:/ffmpeg/bin",
+                    "C:/Program Files/ffmpeg/bin",
+                    "D:/ffmpeg/bin",
+                ] {
                     candidates.push(PathBuf::from(base).join(exe_name()));
                 }
             }
@@ -71,7 +76,11 @@ pub fn available() -> bool {
 }
 
 fn exe_name() -> &'static str {
-    if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }
+    if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
 }
 
 /// 真跑一次 `-version`：同名文件不代表能执行（权限、架构不符、AppLocker 都会挡）。
@@ -90,11 +99,17 @@ fn works(candidate: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn open(path: &Path, target_rate: u32) -> anyhow::Result<Box<dyn Decoder>> {
+pub fn open(
+    path: &Path,
+    target_rate: u32,
+    window: Option<TimeWindow>,
+) -> anyhow::Result<Box<dyn Decoder>> {
     let exe = ffmpeg_path()
         .context("找不到 ffmpeg。装一个（或在设置里指定 NGY_AUDIO_FFMPEG）就能播这个格式")?
         .to_path_buf();
-    let mut decoder = FfmpegDecoder::spawn(exe, path, target_rate, Duration::ZERO)
+    let start = window.map(|window| window.start).unwrap_or_default();
+    let len = window.map(|window| window.len());
+    let mut decoder = FfmpegDecoder::spawn(exe, path, target_rate, start, len)
         .with_context(|| format!("ffmpeg 无法解码：{}", path.display()))?;
 
     // 只 spawn 成功不代表这个文件是音频：ffmpeg 是先起进程、后探测输入的。
@@ -119,6 +134,10 @@ pub struct FfmpegDecoder {
     produced_any: bool,
     /// 打开时试解出来的第一块。
     primer: Option<Vec<f32>>,
+    /// 分轨在文件里的起点。对外的时间轴从 0 开始。
+    offset: Duration,
+    /// 分轨长度；`None` 表示播到文件尾。
+    len: Option<Duration>,
 }
 
 impl FfmpegDecoder {
@@ -127,6 +146,7 @@ impl FfmpegDecoder {
         path: &Path,
         rate: u32,
         start: Duration,
+        len: Option<Duration>,
     ) -> anyhow::Result<Self> {
         let mut command = Command::new(&exe);
         command
@@ -136,13 +156,20 @@ impl FfmpegDecoder {
             .arg("error");
         if start > Duration::ZERO {
             // 放在 -i 之前是 input seek：直接跳到目标附近的包，不必解码前面的全部内容。
-            command.arg("-ss").arg(format!("{:.3}", start.as_secs_f64()));
+            command
+                .arg("-ss")
+                .arg(format!("{:.3}", start.as_secs_f64()));
         }
         command
             .arg("-i")
             .arg(path)
             // 只要第一条音轨，忽略视频/字幕。视频容器也能因此只解音频。
-            .args(["-map", "0:a:0", "-vn", "-sn", "-dn"])
+            .args(["-map", "0:a:0", "-vn", "-sn", "-dn"]);
+        if let Some(len) = len.filter(|len| !len.is_zero()) {
+            // 输出侧截断：分轨播到这个位置就该结束，后面的属于下一首。
+            command.arg("-t").arg(format!("{:.3}", len.as_secs_f64()));
+        }
+        command
             .args(["-ac", &CHANNELS.to_string()])
             .args(["-ar", &rate.to_string()])
             // 统一成 32 位浮点裸流：与内部表示一致，省掉一层整数转换。
@@ -194,6 +221,8 @@ impl FfmpegDecoder {
             buffer: vec![0u8; CHUNK_FRAMES * CHANNELS * BYTES_PER_SAMPLE],
             produced_any: false,
             primer: None,
+            offset: start,
+            len,
         })
     }
 
@@ -205,7 +234,11 @@ impl FfmpegDecoder {
             .lock()
             .map(|tail| tail.trim().to_string())
             .unwrap_or_default();
-        if text.is_empty() { "ffmpeg 没有给出原因（可能这条音轨不存在）".into() } else { text }
+        if text.is_empty() {
+            "ffmpeg 没有给出原因（可能这条音轨不存在）".into()
+        } else {
+            text
+        }
     }
 }
 
@@ -215,7 +248,10 @@ impl Decoder for FfmpegDecoder {
     }
 
     fn spec(&self) -> StreamSpec {
-        StreamSpec { rate: self.rate, channels: CHANNELS as u16 }
+        StreamSpec {
+            rate: self.rate,
+            channels: CHANNELS as u16,
+        }
     }
 
     fn next_chunk(&mut self) -> anyhow::Result<Option<Vec<f32>>> {
@@ -259,9 +295,16 @@ impl Decoder for FfmpegDecoder {
 
     fn seek(&mut self, to: Duration) -> anyhow::Result<()> {
         // ffmpeg 没有「原地 seek」这种便宜事：杀掉重启，用 -ss 从目标处重新开流。
+        // `to` 是窗口内时间，落到文件里要加回分轨起点；剩余的窗口长度也要跟着缩。
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let restarted = Self::spawn(self.exe.clone(), &self.path, self.rate, to)?;
+        let restarted = Self::spawn(
+            self.exe.clone(),
+            &self.path,
+            self.rate,
+            self.offset + to,
+            self.len.map(|len| len.saturating_sub(to)),
+        )?;
         *self = restarted;
         Ok(())
     }
@@ -301,7 +344,11 @@ pub(crate) fn command(exe: impl AsRef<Path>) -> Command {
 /// 同目录下的 ffprobe；没有就返回 None。
 pub(crate) fn ffprobe_path() -> Option<PathBuf> {
     let ffmpeg = ffmpeg_path()?;
-    let name = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+    let name = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
     let probe = ffmpeg.with_file_name(name);
     probe.is_file().then_some(probe)
 }

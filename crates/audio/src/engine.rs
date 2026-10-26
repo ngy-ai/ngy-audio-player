@@ -344,7 +344,7 @@ fn decode_loop(
 fn start_session(shared: &Arc<Shared>, track: Track, target_rate: u32) -> Option<Session> {
     shared.begin_load(track.clone());
 
-    let decoder = match decode::open(&track.path, target_rate) {
+    let decoder = match decode::open_range(&track.path, target_rate, track.window) {
         Ok(decoder) => decoder,
         Err(error) => {
             shared.set_error(format!("{error:#}"));

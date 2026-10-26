@@ -7,9 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ngy_audio_engine::cue;
 use ngy_audio_engine::decode;
 use ngy_audio_engine::format;
-use ngy_audio_engine::meta::TrackMeta;
+use ngy_audio_engine::meta::{TimeWindow, TrackMeta};
 
 fn testdata_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -135,6 +136,71 @@ fn seek_to_reported_duration_does_not_go_out_of_range() {
         checked += 1;
     }
     assert!(checked > 0, "testdata 里没有可用于 seek 的样本");
+}
+
+/// 分轨曲目必须只交出窗口内那一段，而且两条后端都要做到。
+#[test]
+fn window_limits_decoding_to_the_slice() {
+    let dir = testdata_dir();
+    let window = TimeWindow {
+        start: Duration::from_millis(300),
+        end: Duration::from_millis(600),
+    };
+    let mut checked = 0;
+    for name in ["tone.wav", "tone.flac", "tone.mp3", "tone.opus"] {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let mut decoder = decode::open_range(&path, 48_000, Some(window))
+            .unwrap_or_else(|error| panic!("{name} 打不开：{error:#}"));
+        let rate = decoder.spec().rate;
+        let mut frames = 0u64;
+        while let Some(chunk) = decoder.next_chunk().expect("解码失败") {
+            frames += (chunk.len() / 2) as u64;
+        }
+        let seconds = frames as f64 / rate as f64;
+        // 编码器补白与包边界会让它略长，但不能长到把整轨都放出来。
+        assert!(
+            (0.25..=0.40).contains(&seconds),
+            "{name} 的窗口 0.3s 解出了 {seconds:.3}s"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "testdata 里没有可用于分轨的样本");
+}
+
+/// 整轨 + cue → 多条独立曲目，时长各自独立。
+#[test]
+fn cue_expands_one_file_into_separate_tracks() {
+    let dir = testdata_dir();
+    let audio = dir.join("tone.wav");
+    if !audio.is_file() {
+        eprintln!("跳过：缺少 tone.wav");
+        return;
+    }
+
+    let sheet = dir.join("__test__.cue");
+    std::fs::write(
+        &sheet,
+        "PERFORMER \"测试艺人\"\nTITLE \"整轨\"\nFILE \"tone.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"第一段\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"第二段\"\n    INDEX 01 00:00:60\n",
+    )
+    .unwrap();
+
+    let tracks = cue::expand(&sheet).expect("cue 展开失败");
+    let _ = std::fs::remove_file(&sheet);
+
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].title, "第一段");
+    assert_eq!(tracks[0].artist, "测试艺人");
+    let first = tracks[0].window.expect("第一段没有时间窗");
+    assert_eq!(first.start, Duration::ZERO);
+    // 60 帧 = 0.8 秒。
+    assert_eq!(first.end, Duration::from_millis(800));
+    let second = tracks[1].window.expect("第二段没有时间窗");
+    assert_eq!(second.start, Duration::from_millis(800));
+    // 时长必须是这一段自己的长度，而不是整轨的 1.2 秒。
+    assert_eq!(tracks[1].duration, Some(Duration::from_millis(400)));
 }
 
 #[test]
