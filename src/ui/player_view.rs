@@ -81,6 +81,35 @@ impl RepeatMode {
     }
 }
 
+/// 列表排序方式。`Manual` 是用户拖出来的顺序。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKey {
+    Manual,
+    Title,
+    Artist,
+    Duration,
+}
+
+impl SortKey {
+    fn next(self) -> Self {
+        match self {
+            SortKey::Manual => SortKey::Title,
+            SortKey::Title => SortKey::Artist,
+            SortKey::Artist => SortKey::Duration,
+            SortKey::Duration => SortKey::Manual,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Manual => "排序：默认",
+            SortKey::Title => "排序：标题",
+            SortKey::Artist => "排序：艺人",
+            SortKey::Duration => "排序：时长",
+        }
+    }
+}
+
 /// 一个播放列表。
 ///
 /// `id` 只做内部标识：异步探测标签回来时要靠它找回「当初加入的那个列表」，
@@ -147,6 +176,11 @@ pub struct PlayerView {
     repeat: RepeatMode,
     /// 随机播放是独立开关：随机 × 循环才有完整语义。
     shuffle: bool,
+    /// 当前列表里可见的行：存的是 `tracks` 的下标，按显示顺序。
+    view: Vec<usize>,
+    sort: SortKey,
+    /// 列表内搜索的关键字。空表示不过滤。
+    query: String,
     has_ffmpeg: bool,
     dark: bool,
     /// 一次性提示（例如「这个格式需要 ffmpeg」），过几秒自动消失。
@@ -282,6 +316,9 @@ impl PlayerView {
             cover_for: None,
             repeat: RepeatMode::All,
             shuffle: false,
+            view: Vec::new(),
+            sort: SortKey::Manual,
+            query: String::new(),
             has_ffmpeg: ngy_audio_engine::has_ffmpeg(),
             dark,
             notice: None,
@@ -430,18 +467,63 @@ impl PlayerView {
         snapshot_can_seek(self.snapshot.as_ref())
     }
 
-    /// 把整条列表交给引擎当队列，并从 `index` 开播。
+    /// 重算可见行。列表增删、标签回填、排序方式或搜索关键字变化之后都要调一次。
     ///
-    /// 「下一首是谁」由引擎决定，UI 只负责按列表顺序提供候选。
-    fn play_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(track) = self.active_tracks().get(index).cloned() else {
+    /// `view` 存的是 `tracks` 的下标：**行号（可见位置）和真实下标从此是两回事**，
+    /// 渲染和播放用行号，增删改重排用真实下标。搜索是在这里做的一次过滤，
+    /// 所以过滤后的列表同时也是播放队列。
+    fn refresh_view(&mut self) {
+        let tracks = &self.playlists[self.active].tracks;
+        let needle = self.query.trim().to_lowercase();
+        let mut view: Vec<usize> = (0..tracks.len())
+            .filter(|index| track_matches(&tracks[*index], &needle))
+            .collect();
+        match self.sort {
+            SortKey::Manual => {}
+            SortKey::Title => view.sort_by(|a, b| {
+                tracks[*a]
+                    .title
+                    .to_lowercase()
+                    .cmp(&tracks[*b].title.to_lowercase())
+                    .then(a.cmp(b))
+            }),
+            SortKey::Artist => view.sort_by(|a, b| {
+                let key = |index: usize| {
+                    let track = &tracks[index];
+                    (
+                        track.artist.to_lowercase(),
+                        track.album.to_lowercase(),
+                        track.title.to_lowercase(),
+                    )
+                };
+                key(*a).cmp(&key(*b))
+            }),
+            SortKey::Duration => view.sort_by_key(|index| tracks[*index].duration),
+        }
+        self.view = view;
+    }
+
+    /// 按显示顺序取出可见曲目。队列就是「用户看到的这一份」。
+    fn visible_tracks(&self) -> Vec<Arc<TrackMeta>> {
+        let tracks = self.active_tracks();
+        self.view
+            .iter()
+            .filter_map(|index| tracks.get(*index))
+            .cloned()
+            .collect()
+    }
+
+    /// 播第 `position` 行（可见顺序）。
+    fn play_position(&mut self, position: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.visible_tracks();
+        let Some(track) = items.get(position).cloned() else {
             return;
         };
         self.playing = Some(track.clone());
         self.scrubbing = false;
         self.seek_pending = None;
         if let Some(player) = &self.player {
-            player.play(self.active_tracks().to_vec(), index);
+            player.play(items, position);
         }
         self.load_cover(&track, cx);
         self.notice = None;
@@ -451,18 +533,22 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// 播「真实下标」为 `index` 的那首（命令行、拖放、cue 导入用）。
+    fn play_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(position) = self.view.iter().position(|item| *item == index) {
+            self.play_position(position, window, cx);
+        }
+    }
+
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tracks().is_empty() {
+        let count = self.view.len();
+        if count == 0 {
             return;
         }
         // 还没开始播时按「下一首」就是从头开始，按「上一首」从末尾开始。
         if self.playing.is_none() {
-            let index = if delta < 0 {
-                self.active_tracks().len() - 1
-            } else {
-                0
-            };
-            self.play_index(index, window, cx);
+            let position = if delta < 0 { count - 1 } else { 0 };
+            self.play_position(position, window, cx);
             return;
         }
         let Some(player) = &self.player else {
@@ -478,10 +564,14 @@ impl PlayerView {
         cx.notify();
     }
 
-    /// 列表增删 / 重排之后同步给引擎。
-    fn sync_queue(&self) {
+    /// 列表增删 / 重排 / 排序方式变化之后同步给引擎。
+    ///
+    /// 顺手重算可见行：所有改动列表的地方本来就要调这个函数，把刷新挂在这里
+    /// 就不会漏掉某一处（漏一处的表现是「列表里少了一行」这种难查的问题）。
+    fn sync_queue(&mut self) {
+        self.refresh_view();
         if let Some(player) = &self.player {
-            player.set_queue(self.active_tracks().to_vec());
+            player.set_queue(self.visible_tracks());
         }
     }
 
@@ -781,6 +871,8 @@ impl PlayerView {
                     this.playing = Some(track.clone());
                     this.load_cover(&track, cx);
                 }
+                // 标签回来了：按标题/艺人排序的列表要跟着重排。
+                this.sync_queue();
                 cx.notify();
             });
         })
@@ -976,6 +1068,43 @@ impl PlayerView {
         self.sync_queue();
         self.save_library();
         cx.notify();
+    }
+
+    /// 搜索当前列表。走和改名一样的原生输入框：输入框的事件在 gpui-component
+    /// 里没有稳定的公开订阅面，用对话框拿「确认后的值」最稳。
+    fn open_search_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 带着当前关键字打开：再点一次搜索能看见、也能改掉现在的过滤条件。
+        let current = self.query.clone();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(current)
+                .placeholder("标题、艺人或专辑，留空恢复全部")
+        });
+        let view = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .confirm()
+                .title("搜索当前列表")
+                .description("只过滤你看到的这份列表，不改动文件。")
+                .ok_text("应用")
+                .cancel_text("取消")
+                .child(Input::new(&input))
+                .on_ok({
+                    let input = input.clone();
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        let query = input.read(cx).value().to_string();
+                        if let Some(view) = view.upgrade() {
+                            view.update(cx, |this, cx| {
+                                this.query = query.trim().to_string();
+                                this.sync_queue();
+                                cx.notify();
+                            });
+                        }
+                        true
+                    }
+                })
+        });
     }
 
     /// 打开新建 / 重命名的输入对话框。
@@ -1174,6 +1303,16 @@ fn path_key(path: &Path) -> String {
     } else {
         key
     }
+}
+
+/// 列表内搜索的匹配规则：标题 / 艺人 / 专辑任一命中即可（不区分大小写）。
+///
+/// `needle` 由调用方转成小写；空关键字直接放行，留空就是「不过滤」。
+fn track_matches(track: &TrackMeta, needle: &str) -> bool {
+    needle.is_empty()
+        || track.title.to_lowercase().contains(needle)
+        || track.artist.to_lowercase().contains(needle)
+        || track.album.to_lowercase().contains(needle)
 }
 
 /// 待探测的一条曲目：路径，以及分轨的时间窗（整轨为 `None`）。
@@ -1816,6 +1955,57 @@ impl Render for PlayerView {
                 })),
         );
 
+        playlist_bar = playlist_bar.child(
+            div()
+                .id("search-tracks")
+                .test_support()
+                .child(
+                    Button::new("search-tracks-button")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Search)
+                        .tooltip("搜索当前列表"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.open_search_dialog(window, cx))),
+        );
+
+        // 过滤生效时留一个能一键清掉的标记：列表里少了几首，看起来会像丢了数据。
+        if !self.query.is_empty() {
+            playlist_bar = playlist_bar.child(
+                h_flex()
+                    .id("search-filter")
+                    .test_support()
+                    .h(px(26.0))
+                    .px_2()
+                    .gap_1()
+                    .rounded_full()
+                    .items_center()
+                    .text_xs()
+                    .bg(primary.opacity(0.14))
+                    .text_color(primary)
+                    .child(
+                        div()
+                            .max_w(px(160.0))
+                            .truncate()
+                            .child(format!("搜索：{}", self.query)),
+                    )
+                    .child(
+                        div()
+                            .id("search-clear")
+                            .test_support()
+                            .size(px(16.0))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .child(Icon::new(IconName::X).size(px(12.0)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.query.clear();
+                                this.sync_queue();
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+
         let tracks = self.active_tracks();
         let current_index = self.current_index();
 
@@ -1835,9 +2025,22 @@ impl Render for PlayerView {
                     .text_color(muted_foreground)
                     .child("列表是空的。\n\n拖文件进来，或者点右上角「文件」/「文件夹」。"),
             );
+        } else if self.view.is_empty() {
+            list = list.child(
+                div()
+                    .p_4()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child("没有匹配的曲目。换个关键字，或者点上面的搜索标记清掉过滤。"),
+            );
         }
 
-        for (index, track) in tracks.iter().enumerate() {
+        // 行号跟着可见顺序走，`index` 仍是 `tracks` 里的真实下标——
+        // 增删、重排、拖拽都用它，点击播放用行号。
+        for (position, index) in self.view.clone().into_iter().enumerate() {
+            let Some(track) = tracks.get(index) else {
+                continue;
+            };
             let selected = current_index == Some(index);
             let is_current = selected && playing;
             let duration_text = track
@@ -1902,7 +2105,7 @@ impl Render for PlayerView {
                         this.move_track_to(drag.from, index, cx);
                     }))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.play_index(index, window, cx);
+                        this.play_position(position, window, cx);
                     }))
                     .child(
                         div()
@@ -1922,7 +2125,7 @@ impl Render for PlayerView {
                                     .text_color(primary)
                                     .into_any_element()
                             } else {
-                                div().child(format!("{}", index + 1)).into_any_element()
+                                div().child(format!("{}", position + 1)).into_any_element()
                             }),
                     )
                     .child(
@@ -2157,6 +2360,24 @@ impl Render for PlayerView {
                     .on_click(cx.listener(|this, _, window, cx| this.step(1, window, cx))),
             )
             .child(shuffle_button)
+            .child(
+                // 排序是循环切换：默认（拖出来的顺序）→ 标题 → 艺人 → 时长。
+                div()
+                    .id("sort")
+                    .test_support()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .hover(|this| this.bg(muted))
+                    .child(self.sort.label())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sort = this.sort.next();
+                        this.sync_queue();
+                        cx.notify();
+                    })),
+            )
             .child(
                 Button::new("repeat")
                     .ghost()
@@ -2839,6 +3060,92 @@ mod tests {
             cx.update(|app| names(app)),
             vec![before[0].clone(), before[2].clone()]
         );
+    }
+
+    /// 手搓一条带标签的曲目：搜索只看元数据，不依赖 testdata 与解码。
+    fn tagged(path: &str, title: &str, artist: &str, album: &str) -> Arc<TrackMeta> {
+        let mut meta = TrackMeta::placeholder(Path::new(path));
+        meta.title = title.into();
+        meta.artist = artist.into();
+        meta.album = album.into();
+        Arc::new(meta)
+    }
+
+    #[test]
+    fn search_matches_title_artist_and_album_ignoring_case() {
+        let track = tagged("a.mp3", "Lemon", "米津玄師", "STRAY SHEEP");
+        assert!(track_matches(&track, ""), "空关键字应当放行");
+        assert!(track_matches(&track, "lemon"), "标题不区分大小写");
+        assert!(track_matches(&track, "stray"), "专辑也能命中");
+        assert!(track_matches(&track, "米津"), "艺人也能命中");
+        assert!(!track_matches(&track, "周杰伦"));
+    }
+
+    #[gpui_kit::test]
+    fn searching_filters_rows_and_clearing_restores_them(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, _cx| {
+                    view.playlists[0].tracks = vec![
+                        tagged("a.mp3", "晴天", "周杰伦", "叶惠美"),
+                        tagged("b.flac", "Lemon", "米津玄師", "STRAY SHEEP"),
+                        tagged("c.wav", "夜曲", "周杰伦", "十一月的萧邦"),
+                    ];
+                    view.sync_queue();
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("track:2").is_some(), "没过滤时三行都在");
+        })
+        .unwrap();
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.query = "周杰伦".into();
+                view.sync_queue();
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("track:0").is_some());
+            assert!(
+                window.try_find("track:1").is_none(),
+                "Lemon 不该留在过滤后的列表里"
+            );
+            assert!(window.try_find("track:2").is_some());
+        })
+        .unwrap();
+
+        // 过滤后的可见行就是播放队列，队列里只该剩命中的两首。
+        assert_eq!(
+            cx.update(|app| view.read(app).visible_tracks().len()),
+            2,
+            "队列应当只剩命中关键字的曲目"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("search-clear", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let state = cx.update(|app| {
+            let view = view.read(app);
+            (view.query.clone(), view.visible_tracks().len())
+        });
+        assert!(state.0.is_empty(), "点标记应当清掉关键字");
+        assert_eq!(state.1, 3, "清掉之后三首都要回来");
     }
 
     #[gpui_kit::test]
