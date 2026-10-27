@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -113,6 +114,39 @@ impl SortKey {
             SortKey::Duration => "排序：时长",
         }
     }
+}
+
+/// 菜单栏里能触发的事情。
+///
+/// 菜单项的回调只能是 `Fn`，闭包被放进弹层后就无法再按值取用；
+/// 用一个 `Copy` 的枚举回到 `PlayerView::run_menu_action` 统一分发。
+#[derive(Clone, Copy)]
+enum MenuAction {
+    OpenFiles,
+    OpenFolder,
+    DefaultPlayer,
+    ToggleTheme,
+    Quit,
+}
+
+/// 造一个菜单项。视图已经关掉时点击什么也不做。
+fn menu_item(
+    view: &WeakEntity<PlayerView>,
+    action: MenuAction,
+    label: impl Into<SharedString>,
+    icon: Option<IconName>,
+    checked: bool,
+) -> PopupMenuItem {
+    let view = view.clone();
+    let mut item = PopupMenuItem::new(label).checked(checked);
+    if let Some(icon) = icon {
+        item = item.icon(icon);
+    }
+    item.on_click(move |_, window, cx| {
+        if let Some(view) = view.upgrade() {
+            view.update(cx, |this, cx| this.run_menu_action(action, window, cx));
+        }
+    })
 }
 
 /// 一个播放列表。
@@ -1135,6 +1169,38 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// 菜单项统一入口：每一项最终都落到已有的按钮处理函数上。
+    fn run_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            MenuAction::OpenFiles => self.open_files(window, cx),
+            MenuAction::OpenFolder => self.open_folder(window, cx),
+            MenuAction::DefaultPlayer => self.open_default_dialog(window, cx),
+            MenuAction::ToggleTheme => self.toggle_theme(window, cx),
+            MenuAction::Quit => window.remove_window(),
+        }
+    }
+
+    /// 「设为默认播放器」菜单项的状态：文案、图标、勾选都要说出当前进度，
+    /// 否则用户点完不知道有没有生效。
+    fn default_player_entry(&self) -> (String, IconName, bool) {
+        match self.shell_status {
+            shell::Status::Unsupported | shell::Status::Absent => {
+                ("设为默认播放器".to_string(), IconName::Settings, false)
+            }
+            shell::Status::Registered { defaults, total } if total > 0 && defaults == total => {
+                ("已是默认播放器".to_string(), IconName::Settings, true)
+            }
+            shell::Status::Registered { defaults, total } if defaults > 0 => (
+                format!("已默认 {defaults}/{total} 种格式"),
+                IconName::Settings,
+                false,
+            ),
+            shell::Status::Registered { .. } => {
+                ("已登记为打开方式".to_string(), IconName::Settings, false)
+            }
+        }
+    }
+
     /// 从当前列表移除一行；移掉的正是正在播的那首就停下，
     /// 免得界面已经没这首歌、引擎还在出声。
     fn remove_track(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1490,6 +1556,72 @@ impl PlayerView {
             self.probe_tracks(list_id, entries, cx);
         }
         self.sync_queue();
+    }
+
+    /// 顶部菜单栏。
+    ///
+    /// 用 `dropdown_menu` 自绘，而不是 `AppMenuBar`：后者只从全局注册的 action
+    /// 菜单里取内容，而这里的每一项都要拿到 `Context<PlayerView>`（弹对话框、
+    /// 切主题），直接回调比注册一堆 action 少一层间接。
+    fn render_menu_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let top = |id: &'static str, label: &'static str| {
+            Button::new(id).ghost().small().compact().label(label)
+        };
+
+        let (shell_label, shell_icon, shell_checked) = self.default_player_entry();
+        // 非 Windows 没有「默认播放器」这回事，整项不出现。
+        let has_default_player = !matches!(self.shell_status, shell::Status::Unsupported);
+        let file_view = view.clone();
+        let file_menu = top("menu-file-button", "文件").dropdown_menu(move |menu, _, _| {
+            let mut menu = menu
+                .item(menu_item(
+                    &file_view,
+                    MenuAction::OpenFiles,
+                    "打开文件…",
+                    Some(IconName::FilePlus),
+                    false,
+                ))
+                .item(menu_item(
+                    &file_view,
+                    MenuAction::OpenFolder,
+                    "打开文件夹…",
+                    Some(IconName::FolderOpen),
+                    false,
+                ));
+            if has_default_player {
+                menu = menu.separator().item(menu_item(
+                    &file_view,
+                    MenuAction::DefaultPlayer,
+                    shell_label.clone(),
+                    Some(shell_icon),
+                    shell_checked,
+                ));
+            }
+            menu.separator()
+                .item(menu_item(&file_view, MenuAction::Quit, "退出", None, false))
+        });
+
+        let theme_view = view;
+        let dark = self.dark;
+        let view_menu = top("menu-view-button", "视图").dropdown_menu(move |menu, _, _| {
+            menu.item(menu_item(
+                &theme_view,
+                MenuAction::ToggleTheme,
+                "深色模式",
+                None,
+                dark,
+            ))
+        });
+
+        // `Button` 是 RenderOnce，挂不上 test_support；包一层给它一个可点中的身份。
+        let slot = |id: &'static str, menu: AnyElement| div().id(id).test_support().child(menu);
+
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(slot("menu-file", file_menu.into_any_element()))
+            .child(slot("menu-view", view_menu.into_any_element()))
     }
 }
 
@@ -1853,7 +1985,7 @@ impl Render for PlayerView {
                     track.artist.clone()
                 }
             })
-            .unwrap_or_else(|| "把音频文件拖进来，或者点右上角打开".into());
+            .unwrap_or_else(|| "把音频文件拖进来，或者从「文件」菜单打开".into());
         let spec_line = current_track
             .as_ref()
             .map(|track| track.spec_line())
@@ -1883,19 +2015,6 @@ impl Render for PlayerView {
         };
         // 没有装进解码器的曲目时进度条置灰：拖它只会得到一个没有意义的位置。
         let can_seek = snapshot_can_seek(snapshot.as_ref());
-
-        // 「设为默认」按钮：文案与图标都要说出当前状态，否则用户点完不知道有没有生效。
-        let (shell_label, shell_icon) = match self.shell_status {
-            shell::Status::Unsupported => (String::new(), IconName::Settings),
-            shell::Status::Absent => ("设为默认".to_string(), IconName::Settings),
-            shell::Status::Registered { defaults, total } if total > 0 && defaults == total => {
-                ("已是默认".to_string(), IconName::CircleCheck)
-            }
-            shell::Status::Registered { defaults, total } if defaults > 0 => {
-                (format!("已默认 {defaults}/{total}"), IconName::Settings)
-            }
-            shell::Status::Registered { .. } => ("已登记".to_string(), IconName::Settings),
-        };
 
         let notice = self
             .notice
@@ -1967,10 +2086,9 @@ impl Render for PlayerView {
                 .border_b_1()
                 .border_color(border)
                 .child(
-                    // 这一块是窗口拖动区：只包标题，不包按钮（否则点按钮会变成拖窗）。
+                    // 这一块是窗口拖动区：只包标题，不包菜单 / 按钮（否则点它们会变成拖窗）。
                     h_flex()
                         .id("title-area")
-                        .flex_1()
                         .h_full()
                         .items_center()
                         .gap_3()
@@ -1989,77 +2107,38 @@ impl Render for PlayerView {
                                 )),
                         ),
                 )
+                // 菜单栏：原来的「文件」「文件夹」「主题」「设为默认」按钮都收进菜单。
+                .child(self.render_menu_bar(cx))
+                // 标题和窗口按钮之间的空白仍然可以拖窗。
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            Button::new("open-files")
-                                .outline()
-                                .small()
-                                .icon(IconName::FilePlus)
-                                .label("文件")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.open_files(window, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new("open-folder")
-                                .outline()
-                                .small()
-                                .icon(IconName::FolderOpen)
-                                .label("文件夹")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.open_folder(window, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new("theme")
-                                .ghost()
-                                .small()
-                                .icon(if self.dark {
-                                    IconName::Sun
-                                } else {
-                                    IconName::Moon
-                                })
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.toggle_theme(window, cx)
-                                    }),
-                                ),
-                        )
-                        .when(
-                            !matches!(self.shell_status, shell::Status::Unsupported),
-                            |this| {
-                                this.child(
-                                    Button::new("default-player")
-                                        .outline()
-                                        .small()
-                                        .icon(shell_icon)
-                                        .label(shell_label.clone())
-                                        .tooltip("在系统里把音频文件交给声波打开")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_default_dialog(window, cx)
-                                        })),
-                                )
-                            },
-                        )
-                        .when(SHOW_WINDOW_CONTROLS, |this| {
-                            this.child(div().w(px(1.0)).h(px(20.0)).mx_1().bg(border))
-                                .child(
-                                    control("win-min", IconName::Minus, false)
-                                        .on_click(|_, window, _| window.minimize_window()),
-                                )
-                                .child(
-                                    control("win-max", IconName::Maximize2, false)
-                                        .on_click(|_, window, _| window.zoom_window()),
-                                )
-                                .child(
-                                    control("win-close", IconName::X, true)
-                                        .on_click(|_, window, _| window.remove_window()),
-                                )
+                    div()
+                        .id("title-drag")
+                        .flex_1()
+                        .h_full()
+                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                            window.start_window_move()
                         }),
-                ),
+                )
+                .when(SHOW_WINDOW_CONTROLS, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().w(px(1.0)).h(px(20.0)).mx_1().bg(border))
+                            .child(
+                                control("win-min", IconName::Minus, false)
+                                    .on_click(|_, window, _| window.minimize_window()),
+                            )
+                            .child(
+                                control("win-max", IconName::Maximize2, false)
+                                    .on_click(|_, window, _| window.zoom_window()),
+                            )
+                            .child(
+                                control("win-close", IconName::X, true)
+                                    .on_click(|_, window, _| window.remove_window()),
+                            ),
+                    )
+                }),
         );
 
         // —— 错误 / 提示条 ——
@@ -2272,7 +2351,7 @@ impl Render for PlayerView {
                     .p_4()
                     .text_xs()
                     .text_color(muted_foreground)
-                    .child("列表是空的。\n\n拖文件进来，或者点右上角「文件」/「文件夹」。"),
+                    .child("列表是空的。\n\n拖文件进来，或者用「文件」菜单打开文件 / 文件夹。"),
             );
         } else if self.view.is_empty() {
             list = list.child(
@@ -2887,6 +2966,60 @@ mod tests {
 
         let view = slot.borrow().clone().unwrap();
         assert_eq!(cx.update(|app| view.read(app).active_tracks().len()), 0);
+    }
+
+    #[gpui_kit::test]
+    fn each_menu_opens_its_own_items_under_its_trigger(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let add_view = |cx: &mut TestAppContext| {
+            cx.add_window(|window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                Harness { view }
+            })
+        };
+
+        // 每个菜单新开一个窗口验证：同一窗口里先开一个再开另一个得先关掉，
+        // 而「关掉」不是这里要测的东西。
+        let file_window = add_view(cx);
+        cx.update_window(file_window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let trigger = window
+                .try_find("menu-file")
+                .expect("菜单栏没有渲染出来")
+                .bounds();
+            window.click("menu-file", cx);
+            let menu = window
+                .try_find("popup-menu")
+                .expect("点「文件」之后应当弹出菜单")
+                .bounds();
+            assert!(
+                (menu.origin.x - trigger.origin.x).abs() < px(1.0),
+                "菜单应当贴着「文件」弹出"
+            );
+            assert!(menu.size.height > px(60.0), "「文件」菜单应当有好几项");
+        })
+        .unwrap();
+
+        let view_window = add_view(cx);
+        cx.update_window(view_window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let trigger = window
+                .try_find("menu-view")
+                .expect("菜单栏没有渲染出来")
+                .bounds();
+            window.click("menu-view", cx);
+            let menu = window
+                .try_find("popup-menu")
+                .expect("点「视图」之后应当弹出菜单")
+                .bounds();
+            assert!(
+                (menu.origin.x - trigger.origin.x).abs() < px(1.0),
+                "「视图」应当弹出自己的菜单，而不是复用「文件」的弹层"
+            );
+            assert!(menu.size.height < px(60.0), "「视图」菜单只有一项");
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
