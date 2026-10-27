@@ -1,0 +1,6 @@
+# 本机有 24 个逻辑核，cargo 默认按核数并行编译。GPUI 依赖树里单 crate 编译
+# 动辄数百 MB 内存，24 路并发会撞穿 Windows 提交内存上限（os error 1455），
+# 更糟的是会把 rlib 写成残缺文件，之后报一堆看似无关的 metadata 错误。
+# 6 路足够吃满 CPU 与磁盘 IO，且不会把机器拖死。
+[build]
+jobs = 6

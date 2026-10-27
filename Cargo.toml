@@ -64,8 +64,12 @@ embed-resource = "3"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+# 这里刻意不用 fat LTO + codegen-units=1：GPUI 依赖树很大，那种配置会让每个
+# rustc（含 proc-macro 依赖）都带 linker-plugin-lto，单进程峰值到 GB 级，24 核
+# 并行时直接把 Windows 提交内存打满（os error 1455）。thin LTO 保留跨 crate
+# 优化，内存与耗时低一个数量级，播放器场景性能差异不可感知。
+lto = "thin"
+codegen-units = 16
 strip = true
 
 # GPUI 的布局 / 文本 / 渲染代码在未优化时慢到不可用，只对这几层开优化。
