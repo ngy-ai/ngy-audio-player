@@ -61,6 +61,17 @@ cargo run --release -- a.mp3 b.flac # 直接播
 三平台都能 `cargo build --release`；Windows 需要 MSVC 工具链，Linux 需要
 `libasound2-dev`（cpal 的 ALSA 后端）。
 
+## 设为默认播放器（仅 Windows）
+
+顶栏的「设为默认」按钮会把本程序登记到当前用户（`HKCU`，不需要管理员权限）：
+65 种音频格式进入「打开方式」，同时也出现在系统默认应用页里。登记完会自动打开
+声波那一页 —— 还要在那里把这些格式设成用声波打开，才真正生效。Windows 8 之后不允许
+程序代写 `UserChoice`，代写属于劫持，系统升级后还会失效，所以这里只登记、不硬设
+（见 [ADR 0007](docs/adr/0007-register-but-never-force-default.md)）。
+
+视频容器（`mp4`、`mkv`、`avi` 等 18 个）不在登记范围：它们能放出声音，但不该把
+默认程序抢走。按钮会显示「已登记 / 已默认 n/65 / 已是默认」，再点一次可以「取消登记」。
+
 ## 快捷键
 
 | 键 | 作用 |

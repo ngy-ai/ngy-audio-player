@@ -20,6 +20,8 @@ use ngy_audio_engine::format;
 use ngy_audio_engine::meta::{CoverArt, TimeWindow, TrackMeta};
 use ngy_audio_engine::{PlaybackState, Player, QueueMode, Repeat, Snapshot};
 
+use crate::shell;
+
 use super::cover;
 use super::spectrum::Spectrum;
 
@@ -32,6 +34,9 @@ const TICK: Duration = Duration::from_millis(80);
 const FILE_DIALOG_TITLE: &str = "选择音频文件";
 /// 文件夹对话框标题。
 const FOLDER_DIALOG_TITLE: &str = "选择音乐文件夹";
+/// 「外部打开」列表的名字：系统 / 命令行交进来的文件先落在这里。
+/// 它不写盘、不许改名 —— 见 `CONTEXT.md` 里「外部打开」词条。
+const EXTERNAL_LIST: &str = "外部打开";
 /// seek 到最右端时留的余量（秒）。解码器在末帧 seek 容易报 out-of-range，
 /// ffmpeg 从结尾开流还可能一帧都读不出来。
 const SEEK_END_MARGIN: f64 = 0.05;
@@ -118,6 +123,8 @@ struct Playlist {
     id: u64,
     name: String,
     tracks: Vec<Arc<TrackMeta>>,
+    /// 「外部打开」：由双击 / 命令行交进来，进程退出即丢，不写进库文件。
+    transient: bool,
 }
 
 /// 命名对话框要做的事：新建一个列表，还是给已有列表改名。
@@ -187,6 +194,8 @@ pub struct PlayerView {
     notice: Option<(String, Instant)>,
     /// 已经打开的原生对话框标题：连点会叠出多个窗口，重复点击只把已有窗口提到前台。
     dialog_open: Option<&'static str>,
+    /// 系统里的默认播放器状态。非 Windows 恒为 `Unsupported`，界面上不显示入口。
+    shell_status: shell::Status,
     /// 播放列表保存位置；`None` 表示这次运行不持久化（单元测试）。
     library_path: Option<PathBuf>,
     focus: FocusHandle,
@@ -300,6 +309,7 @@ impl PlayerView {
                 id: 1,
                 name: "列表 1".into(),
                 tracks: Vec::new(),
+                transient: false,
             }],
             active: 0,
             playing: None,
@@ -324,21 +334,44 @@ impl PlayerView {
             notice: None,
             dialog_open: None,
             library_path: library_path(),
+            shell_status: initial_shell_status(),
             focus,
         };
 
-        // 上次退出时的播放列表先回来；命令行文件随后追加到当前列表。
+        // 程序被挪过位置（换了构建产物目录）之后，注册表里写的还是旧路径：
+        // 那样双击音频文件什么都不会发生，比没登记更难查。
+        if let Err(error) = shell::refresh() {
+            eprintln!("[shell] 刷新已登记的路径失败: {error:#}");
+        }
+
+        // 上次退出时的播放列表先回来。
         this.restore_library(cx);
 
-        // 从命令行拿到的文件（`ngy-audio-player a.mp3 b.flac`）。
+        // 双击文件 / 资源管理器交来的参数（`ngy-audio-player a.mp3 b.flac`）：
+        // 进「外部打开」列表并立刻播放。不再追加到上次那份列表里 ——
+        // 否则双击 A 之后响的可能是上次的 B。
         let args: Vec<PathBuf> = std::env::args_os()
             .skip(1)
             .map(PathBuf::from)
             .filter(|path| path.is_file())
             .collect();
         if !args.is_empty() {
-            this.add_paths(args, false, window, cx);
+            this.open_external(args, window, cx);
         }
+
+        // 用户去系统设置里改完默认程序、再切回来时，按钮上的状态要跟着变。
+        // Windows 不会通知我们「关联变了」，只能靠窗口激活回调补读一次。
+        cx.observe_window_activation(window, |this, _window, cx| {
+            if cfg!(test) {
+                return;
+            }
+            let status = shell::status();
+            if status != this.shell_status {
+                this.shell_status = status;
+                cx.notify();
+            }
+        })
+        .detach();
 
         // 唯一一个常驻任务：定时读引擎状态、推动进度条、喂频谱。
         // 80ms 一次：比一帧慢，但足够让进度条与柱子看起来是连续的。
@@ -936,6 +969,158 @@ impl PlayerView {
         .detach();
     }
 
+    /// 准备好「外部打开」列表：有就清空复用，没有就插到标签栏最前面。
+    fn ensure_external_list(&mut self) {
+        if let Some(index) = self.playlists.iter().position(|list| list.transient) {
+            self.playlists[index].tracks.clear();
+            self.active = index;
+        } else {
+            let id = self.next_playlist_id;
+            self.next_playlist_id += 1;
+            self.playlists.insert(
+                0,
+                Playlist {
+                    id,
+                    name: EXTERNAL_LIST.into(),
+                    tracks: Vec::new(),
+                    transient: true,
+                },
+            );
+            self.active = 0;
+        }
+        // 切了列表就得重算可见行，否则渲染还会拿上一张表的行号取曲目。
+        self.sync_queue();
+    }
+
+    /// 系统 / 命令行交进来的文件：替换「外部打开」的内容，并立刻播第一首。
+    fn open_external(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_external_list();
+        self.add_paths(paths, true, window, cx);
+    }
+
+    /// 关掉「外部打开」：只清内容，磁盘上的文件一个都不动。
+    fn clear_external_list(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.playlists.iter().position(|list| list.transient) else {
+            return;
+        };
+        self.playlists.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        if self.active >= self.playlists.len() {
+            self.active = self.playlists.len().saturating_sub(1);
+        }
+        self.sync_queue();
+        cx.notify();
+    }
+
+    /// 顶栏的默认播放器入口。三态共用同一个确认层，只是文案与动作不同。
+    fn open_default_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        let total = shell::extensions().len();
+        match self.shell_status {
+            shell::Status::Registered { defaults, .. } => {
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    alert
+                        .confirm()
+                        .title("默认播放器")
+                        .description(format!(
+                            "声波已在系统里登记 {total} 种音频格式，其中 {defaults} 种已经交给声波打开。\n\n\
+                             Windows 不允许程序自己改默认程序：点「去系统设置」会打开声波那一页，\
+                             在那里把这些格式设成用声波打开（新版 Windows 顶部有「设置默认值」，一次覆盖全部）。\n\
+                             「取消登记」会把声波从「打开方式」里移除，已设为默认的类型会退回询问。"
+                        ))
+                        .ok_text("去系统设置")
+                        .cancel_text("取消登记")
+                        .cancel_variant(ButtonVariant::Danger)
+                        .on_ok({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(cx, |this, cx| this.reopen_settings(cx));
+                                }
+                                true
+                            }
+                        })
+                        .on_cancel({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(cx, |this, cx| this.apply_unregister(cx));
+                                }
+                                true
+                            }
+                        })
+                });
+            }
+            _ => {
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    alert
+                        .confirm()
+                        .title("设为默认播放器")
+                        .description(format!(
+                            "接下来会把 {total} 种音频格式登记到系统（只写当前用户，不需要管理员权限）。\n\n\
+                             然后会打开 Windows 的「默认应用」页 —— 还要在那里把它们设成用声波打开，\
+                             系统不允许程序代劳（新版 Windows 顶部有「设置默认值」，一次覆盖全部）。"
+                        ))
+                        .ok_text("登记并前往设置")
+                        .cancel_text("取消")
+                        .on_ok({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(cx, |this, cx| this.apply_register(cx));
+                                }
+                                true
+                            }
+                        })
+                });
+            }
+        }
+    }
+
+    fn apply_register(&mut self, cx: &mut Context<Self>) {
+        let count = shell::extensions().len();
+        match shell::register() {
+            Ok(()) => {
+                self.shell_status = shell::status();
+                let text = match shell::open_settings() {
+                    Ok(()) => format!("已登记 {count} 种格式，请在系统设置里把它们设成用声波打开"),
+                    Err(error) => format!("已登记 {count} 种格式，但打开系统设置失败：{error:#}"),
+                };
+                self.notice = Some((text, Instant::now()));
+            }
+            Err(error) => {
+                self.notice = Some((format!("登记失败：{error:#}"), Instant::now()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_unregister(&mut self, cx: &mut Context<Self>) {
+        match shell::unregister() {
+            Ok(()) => {
+                self.shell_status = shell::status();
+                self.notice = Some((
+                    "已取消登记，声波不再出现在「打开方式」里".into(),
+                    Instant::now(),
+                ));
+            }
+            Err(error) => {
+                self.notice = Some((format!("取消登记失败：{error:#}"), Instant::now()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn reopen_settings(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = shell::open_settings() {
+            self.notice = Some((format!("打开系统设置失败：{error:#}"), Instant::now()));
+        }
+        self.shell_status = shell::status();
+        cx.notify();
+    }
+
     fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dark = !self.dark;
         Theme::change(
@@ -1015,6 +1200,7 @@ impl PlayerView {
             id,
             name: name.clone(),
             tracks: Vec::new(),
+            transient: false,
         });
         self.active = self.playlists.len() - 1;
         self.notice = Some((format!("已新建「{name}」"), Instant::now()));
@@ -1056,7 +1242,9 @@ impl PlayerView {
     /// 删除一个播放列表：至少保留一个；删掉正在看的那个就落到相邻的列表。
     /// 播放不因此中断——正在响的曲目哪怕来自被删的列表，也会一直播完。
     fn remove_playlist(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.playlists.len() <= 1 || index >= self.playlists.len() {
+        // 「外部打开」不算播放列表：判断「能不能删」时要把它排除。
+        let persistent = self.playlists.iter().filter(|list| !list.transient).count();
+        if persistent <= 1 || index >= self.playlists.len() || self.playlists[index].transient {
             return;
         }
         self.playlists.remove(index);
@@ -1234,7 +1422,18 @@ impl PlayerView {
         let Some(path) = &self.library_path else {
             return;
         };
-        if let Err(error) = write_library(path, &self.playlists, self.active) {
+        // 「外部打开」不落盘，所以写盘用的下标要在一份过滤过的视图里重新算。
+        let lists: Vec<&Playlist> = self
+            .playlists
+            .iter()
+            .filter(|list| !list.transient)
+            .collect();
+        let active = self
+            .playlists
+            .get(self.active)
+            .and_then(|current| lists.iter().position(|list| std::ptr::eq(*list, current)))
+            .unwrap_or(0);
+        if let Err(error) = write_library(path, &lists, active) {
             eprintln!("[library] 保存播放列表失败: {error}");
         }
     }
@@ -1267,6 +1466,7 @@ impl PlayerView {
                         })
                     })
                     .collect(),
+                transient: false,
             })
             .collect();
         self.next_playlist_id = self.playlists.len() as u64 + 1;
@@ -1350,6 +1550,16 @@ struct SavedLibrary {
     playlists: Vec<(String, Vec<SavedTrack>)>,
 }
 
+/// 启动时的默认播放器状态。测试里直接当作不支持：`cargo test` 不该依赖
+/// 开发机的文件关联状态，更不该去读真实注册表。
+fn initial_shell_status() -> shell::Status {
+    if cfg!(test) {
+        shell::Status::Unsupported
+    } else {
+        shell::status()
+    }
+}
+
 /// 配置文件位置。单元测试里返回 `None`：测试不该读写用户真实的配置目录。
 fn library_path() -> Option<PathBuf> {
     if cfg!(test) {
@@ -1419,7 +1629,7 @@ fn unescape_field(text: &str) -> String {
     out
 }
 
-fn serialize_library(playlists: &[Playlist], active: usize) -> String {
+fn serialize_library(playlists: &[&Playlist], active: usize) -> String {
     let mut text = String::from("# 声波播放列表（自动生成，手动改需要保持这个格式）\nversion 2\n");
     text.push_str(&format!("active {active}\n"));
     for playlist in playlists {
@@ -1488,7 +1698,7 @@ fn read_library(path: &Path) -> Option<SavedLibrary> {
     parse_library(&text)
 }
 
-fn write_library(path: &Path, playlists: &[Playlist], active: usize) -> std::io::Result<()> {
+fn write_library(path: &Path, playlists: &[&Playlist], active: usize) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1674,6 +1884,19 @@ impl Render for PlayerView {
         // 没有装进解码器的曲目时进度条置灰：拖它只会得到一个没有意义的位置。
         let can_seek = snapshot_can_seek(snapshot.as_ref());
 
+        // 「设为默认」按钮：文案与图标都要说出当前状态，否则用户点完不知道有没有生效。
+        let (shell_label, shell_icon) = match self.shell_status {
+            shell::Status::Unsupported => (String::new(), IconName::Settings),
+            shell::Status::Absent => ("设为默认".to_string(), IconName::Settings),
+            shell::Status::Registered { defaults, total } if total > 0 && defaults == total => {
+                ("已是默认".to_string(), IconName::CircleCheck)
+            }
+            shell::Status::Registered { defaults, total } if defaults > 0 => {
+                (format!("已默认 {defaults}/{total}"), IconName::Settings)
+            }
+            shell::Status::Registered { .. } => ("已登记".to_string(), IconName::Settings),
+        };
+
         let notice = self
             .notice
             .as_ref()
@@ -1805,6 +2028,22 @@ impl Render for PlayerView {
                                     }),
                                 ),
                         )
+                        .when(
+                            !matches!(self.shell_status, shell::Status::Unsupported),
+                            |this| {
+                                this.child(
+                                    Button::new("default-player")
+                                        .outline()
+                                        .small()
+                                        .icon(shell_icon)
+                                        .label(shell_label.clone())
+                                        .tooltip("在系统里把音频文件交给声波打开")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_default_dialog(window, cx)
+                                        })),
+                                )
+                            },
+                        )
                         .when(SHOW_WINDOW_CONTROLS, |this| {
                             this.child(div().w(px(1.0)).h(px(20.0)).mx_1().bg(border))
                                 .child(
@@ -1884,9 +2123,12 @@ impl Render for PlayerView {
                 .child(Icon::new(icon).size(px(12.0)))
         };
 
+        // 「外部打开」不是播放列表：它只能被清空，不能被改名、也不参与「至少留一张」的计数。
+        let persistent_lists = self.playlists.iter().filter(|list| !list.transient).count();
         for (index, playlist) in self.playlists.iter().enumerate() {
             let selected = index == self.active;
-            let removable = self.playlists.len() > 1;
+            let transient = playlist.transient;
+            let removable = transient || persistent_lists > 1;
             let editable = playlist.id;
             playlist_bar = playlist_bar.child(
                 h_flex()
@@ -1913,26 +2155,33 @@ impl Render for PlayerView {
                             .truncate()
                             .child(playlist.name.clone()),
                     )
-                    .child(
-                        tab_action(
-                            format!("playlist-rename:{index}"),
-                            IconName::PencilLine,
-                            false,
+                    .when(!transient, |this| {
+                        this.child(
+                            tab_action(
+                                format!("playlist-rename:{index}"),
+                                IconName::PencilLine,
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_name_dialog(NameTarget::Rename(editable), window, cx);
+                                },
+                            )),
                         )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_name_dialog(NameTarget::Rename(editable), window, cx);
-                            },
-                        )),
-                    )
+                    })
                     .when(removable, |this| {
                         this.child(
                             tab_action(format!("playlist-remove:{index}"), IconName::X, true)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     // 不拦下来的话，点 × 会先把这个列表切到前台再弹确认。
                                     cx.stop_propagation();
-                                    this.confirm_remove_playlist(index, window, cx);
+                                    if transient {
+                                        // 文件还在磁盘上，清空不需要确认。
+                                        this.clear_external_list(cx);
+                                    } else {
+                                        this.confirm_remove_playlist(index, window, cx);
+                                    }
                                 })),
                         )
                     }),
@@ -2852,11 +3101,12 @@ mod tests {
         let path = dir.join("library.txt");
 
         // 造一份「上次退出时」的列表，然后从一个全新的视图里恢复。
-        let playlists = vec![
+        let playlists = [
             Playlist {
                 id: 1,
                 name: "通勤".into(),
                 tracks: vec![Arc::new(TrackMeta::placeholder(Path::new("a.mp3")))],
+                transient: false,
             },
             Playlist {
                 id: 2,
@@ -2865,9 +3115,11 @@ mod tests {
                     Arc::new(TrackMeta::placeholder(Path::new("b.flac"))),
                     Arc::new(TrackMeta::placeholder(Path::new("c.wav"))),
                 ],
+                transient: false,
             },
         ];
-        write_library(&path, &playlists, 1).expect("应当能写进临时目录");
+        let lists: Vec<&Playlist> = playlists.iter().collect();
+        write_library(&path, &lists, 1).expect("应当能写进临时目录");
 
         let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
         let _window = {
@@ -3344,14 +3596,13 @@ mod tests {
                 .iter()
                 .map(|path| Arc::new(TrackMeta::placeholder(Path::new(path))))
                 .collect(),
+            transient: false,
         };
 
         // 名字里带制表符 / 换行 / 反斜杠，路径里带 Windows 盘符：都是真实会遇到的。
-        let playlists = vec![
-            playlist("夜里的\t歌\n单", &[r"C:\音乐\一 - 二.flac", "/tmp/三.mp3"]),
-            playlist("空列表", &[]),
-        ];
-        let text = serialize_library(&playlists, 1);
+        let first = playlist("夜里的\t歌\n单", &[r"C:\音乐\一 - 二.flac", "/tmp/三.mp3"]);
+        let second = playlist("空列表", &[]);
+        let text = serialize_library(&[&first, &second], 1);
         let saved = parse_library(&text).expect("应当能解回来");
 
         assert_eq!(saved.active, 1);
@@ -3383,13 +3634,14 @@ mod tests {
         let mut meta = TrackMeta::placeholder(Path::new("/tmp/album.flac"));
         meta.window = Some(window);
         meta.duration = Some(window.len());
-        let playlists = vec![Playlist {
+        let playlist = Playlist {
             id: 1,
             name: "整轨".into(),
             tracks: vec![Arc::new(meta)],
-        }];
+            transient: false,
+        };
 
-        let saved = parse_library(&serialize_library(&playlists, 0)).expect("应当能解回来");
+        let saved = parse_library(&serialize_library(&[&playlist], 0)).expect("应当能解回来");
         assert_eq!(saved.playlists[0].1[0].window, Some(window));
     }
 
@@ -3399,8 +3651,10 @@ mod tests {
             id: 1,
             name: name.into(),
             tracks: Vec::new(),
+            transient: false,
         };
-        let text = serialize_library(&[playlist("A"), playlist("B")], 9);
+        let (a, b) = (playlist("A"), playlist("B"));
+        let text = serialize_library(&[&a, &b], 9);
         assert_eq!(
             parse_library(&text).unwrap().active,
             1,

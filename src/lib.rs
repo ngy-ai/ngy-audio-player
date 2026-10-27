@@ -3,4 +3,5 @@
 //! 音频本身完全在 `ngy-audio-engine` 里，这里只负责「把状态画出来、把点击传下去」。
 
 pub mod app;
+pub mod shell;
 pub mod ui;
