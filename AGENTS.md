@@ -57,6 +57,36 @@ cargo clippy --workspace --all-targets -- -D warnings
 7. 不要为了小功能引入新的原生依赖；优先使用现有库（Symphonia、cpal、rubato、
    lofty、ringbuf、rustfft、image、rfd）。
 
+## 文件规模与拆分
+
+单个源码文件不得超过约 **700 行**。大文件既难读也难改，工具读一次就吃掉上下文。
+
+- 超过就按职责拆成子模块，不要继续往上堆：新增代码时如果目标文件已经接近这个上限，
+  先拆再改；拆分提交和功能提交要分开 `git commit`。
+- 现状提醒：`src/ui/player_view.rs`（约 3800 行）、`src/shell.rs`（约 800 行）已超限，
+  下次改动就先拆。
+- 拆分沿用现有布局（参考 `src/ui/mod.rs`、`crates/audio/src/decode/mod.rs`）：
+  - `foo.rs` 拆成 `foo/mod.rs` 加若干 `foo/*.rs`；子模块文件名按职责命名，
+    不叫 `utils.rs` / `helpers.rs` 这类含糊名字（如 `decode/symphonia_backend.rs`）。
+  - `mod.rs` 只放模块文档、`mod` 声明和对外重新导出（`pub use`），不放实现；
+    多处共用的类型单独成文件（`types.rs`、`config.rs`），避免模块间互相引用类型。
+  - 一个职责一个模块，模块名 = 对外概念（`decode/`、`output/`、`ui/`）。
+    子模块只依赖下层与共享基础设施，不反向 import 上层：`decode/*` 不得引用 `engine`；
+    需要回调时用 `impl Fn` / trait 对象从上往下注入。
+  - 同一职责的实现可以分散在多个文件，但对外只经 `mod.rs` 暴露；
+    子模块默认私有（`mod x;`，不是 `pub mod x;`），需要对外时用 `pub use` 精确导出。
+- 测试同样拆分，并与源码布局对应：
+  - 单元测试就近放在被测模块内，用 `foo/tests.rs` 加 `#[cfg(test)] mod tests;`，
+    不要把所有单测堆到一个巨型测试文件里。
+  - 集成测试放 `crates/<crate>/tests/<主题>.rs`，一个文件一个主题，文件名与被测模块同名
+    （现有 `tests/formats.rs`、`tests/playback.rs`）；每个文件是独立测试二进制，
+    跨模块的端到端场景才留在 `tests/` 根目录。
+- 自查超长文件：
+
+  ```bash
+  rg --files -g '*.rs' -g '!target' | xargs wc -l | sort -n | tail -20
+  ```
+
 ## 代码风格
 
 - 使用 rustfmt 默认格式；提交前跑 `cargo fmt --all`。
