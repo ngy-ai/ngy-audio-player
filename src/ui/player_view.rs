@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -130,6 +130,10 @@ enum MenuAction {
     ToggleAutoMaintain,
     ToggleTheme,
     Quit,
+    /// 列表行的右键菜单：删掉第 N 首（N 是列表里的真实下标）。
+    RemoveTrack(usize),
+    /// 列表行的右键菜单：在文件管理器里定位第 N 首。
+    RevealTrack(usize),
 }
 
 /// 造一个菜单项。视图已经关掉时点击什么也不做。
@@ -1292,6 +1296,8 @@ impl PlayerView {
             MenuAction::Unregister => self.confirm_unregister(window, cx),
             MenuAction::ToggleAutoMaintain => self.toggle_auto_maintain(cx),
             MenuAction::ToggleTheme => self.toggle_theme(window, cx),
+            MenuAction::RemoveTrack(index) => self.remove_track(index, cx),
+            MenuAction::RevealTrack(index) => self.reveal_track(index, cx),
             MenuAction::Quit => window.remove_window(),
         }
     }
@@ -1348,12 +1354,15 @@ impl PlayerView {
         }
     }
 
-    /// 上移 / 下移一行。只改列表顺序，不影响正在播放的曲目。
-    fn move_track(&mut self, index: usize, delta: isize, cx: &mut Context<Self>) {
-        let Some(target) = index.checked_add_signed(delta) else {
+    /// 在文件管理器里定位某一首（Windows 上是「打开所在文件夹并选中」）。
+    fn reveal_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(track) = self.active_tracks().get(index) else {
             return;
         };
-        self.move_track_to(index, target, cx);
+        if let Err(error) = shell::reveal(&track.path) {
+            self.notice = Some((format!("定位文件失败：{error:#}"), Instant::now()));
+            cx.notify();
+        }
     }
 
     /// 把第 `from` 行搬到 `to` 的位置（拖动排序）。
@@ -2575,21 +2584,6 @@ impl Render for PlayerView {
             };
             // group 名带行号：同名的话，鼠标划过一行会让每一行的按钮都亮起来。
             let row_group = format!("track-row:{index}");
-            // Button 是 RenderOnce，挂不上 test_support；包一层也能顺手给它一个可点击的 id。
-            let action = |id: &'static str, icon: IconName, tooltip: &'static str| {
-                div()
-                    .id(format!("{id}:{index}"))
-                    .test_support()
-                    .cursor_pointer()
-                    .child(
-                        Button::new((id, index))
-                            .ghost()
-                            .small()
-                            .compact()
-                            .icon(icon)
-                            .tooltip(tooltip),
-                    )
-            };
             list = list.child(
                 h_flex()
                     .id(format!("track:{index}"))
@@ -2688,40 +2682,26 @@ impl Render for PlayerView {
                                     .text_color(muted_foreground),
                             ),
                     )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_0p5()
-                            .items_center()
-                            // 平时完全不显示，鼠标落在这一行才淡入：一直亮着的小图标
-                            // 会把标题挤得没有呼吸空间。位置留着，所以不会引起布局跳动；
-                            // 指针要落到这上面，必须先落在行上，此时已经显出来了。
-                            .opacity(0.0)
-                            .group_hover(row_group, |this| this.opacity(1.0))
-                            .child(action("track-up", IconName::ChevronUp, "上移").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    // 行本身也在监听点击，不拦住就会顺带切歌。
-                                    cx.stop_propagation();
-                                    this.move_track(index, -1, cx);
-                                }),
+                    // 行的操作都收进右键菜单：排序靠拖动，删除和定位文件不需要常驻按钮。
+                    .context_menu({
+                        let view = cx.entity().downgrade();
+                        move |menu, _, _| {
+                            menu.item(menu_item(
+                                &view,
+                                MenuAction::RemoveTrack(index),
+                                "从列表移除",
+                                Some(IconName::Trash),
+                                false,
                             ))
-                            .child(
-                                action("track-down", IconName::ChevronDown, "下移").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.move_track(index, 1, cx);
-                                    }),
-                                ),
-                            )
-                            .child(
-                                action("track-remove", IconName::Trash, "从列表移除").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.remove_track(index, cx);
-                                    }),
-                                ),
-                            ),
-                    ),
+                            .item(menu_item(
+                                &view,
+                                MenuAction::RevealTrack(index),
+                                "定位文件",
+                                Some(IconName::FolderOpen),
+                                false,
+                            ))
+                        }
+                    }),
             );
         }
 
@@ -3294,7 +3274,7 @@ mod tests {
         };
         let before = cx.update(|app| order(app));
 
-        cx.update(|app| view.update(app, |view, cx| view.move_track(0, 1, cx)));
+        cx.update(|app| view.update(app, |view, cx| view.move_track_to(0, 1, cx)));
         let after = cx.update(|app| order(app));
         assert_eq!(after[0], before[1], "下移之后第二首应当排到第一行");
         assert_eq!(after[1], before[0]);
@@ -3572,7 +3552,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn row_buttons_move_and_remove_tracks(cx: &mut TestAppContext) {
+    fn row_context_menu_removes_the_clicked_track(cx: &mut TestAppContext) {
         let paths = samples();
         if paths.len() < 3 {
             eprintln!("跳过：缺少 testdata 样本");
@@ -3613,32 +3593,35 @@ mod tests {
                 .collect()
         };
         let before = cx.update(|app| names(app));
+        let current_before = cx.update(|app| view.read(app).current_index());
 
-        // 第三行点「上移」：顺序换了，正在播的曲目不该被换掉。
+        // 右键第三行：菜单弹出来，但不会顺带切歌——菜单项要再点一次才生效。
         cx.update_window(handle.into(), |_, window, cx| {
-            window.click("track-up:2", cx);
+            window.right_click("track:2", cx);
         })
         .unwrap();
-        let after = cx.update(|app| names(app));
-        assert_eq!(
-            after,
-            vec![before[0].clone(), before[2].clone(), before[1].clone()],
-            "上移应当只交换相邻两行"
+        assert!(
+            cx.update_window(handle.into(), |_, window, _| {
+                window.try_find("popup-menu").is_some()
+            })
+            .unwrap(),
+            "右键一行应当弹出上下文菜单"
         );
         assert_eq!(
             cx.update(|app| view.read(app).current_index()),
-            Some(0),
-            "点上移不该顺带切歌"
+            current_before,
+            "右键不该切歌"
         );
 
-        // 再点第三行的删除：只少这一行。
+        // 菜单里第一项是「从列表移除」，键盘确认后只少这一行。
         cx.update_window(handle.into(), |_, window, cx| {
-            window.click("track-remove:2", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
         })
         .unwrap();
         assert_eq!(
             cx.update(|app| names(app)),
-            vec![before[0].clone(), before[2].clone()]
+            vec![before[0].clone(), before[1].clone()]
         );
     }
 
