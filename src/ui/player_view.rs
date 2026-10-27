@@ -1048,13 +1048,28 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// 确认层里那条「不走系统设置」的快捷方式：文案要如实说清代价。
+    fn force_button(view: gpui::WeakEntity<Self>) -> impl IntoElement {
+        Button::new("force-default-player")
+            .outline()
+            .small()
+            .icon(IconName::CircleCheck)
+            .label("直接设为默认")
+            .on_click(move |_, window, cx| {
+                window.close_dialog(cx);
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| this.apply_force_defaults(cx));
+                }
+            })
+    }
+
     /// 顶栏的默认播放器入口。三态共用同一个确认层，只是文案与动作不同。
     fn open_default_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         let total = shell::extensions().len();
         match self.shell_status {
             shell::Status::Registered { defaults, .. } => {
-                window.open_alert_dialog(cx, move |alert, _, _| {
+                window.open_alert_dialog(cx, move |alert, _, cx| {
                     alert
                         .confirm()
                         .title("默认播放器")
@@ -1085,10 +1100,26 @@ impl PlayerView {
                                 true
                             }
                         })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(
+                                            "高级：跳过系统设置，直接把全部格式写成默认。\
+                                             这会绕过 Windows 的默认程序保护，系统大版本更新后可能失效。",
+                                        ),
+                                )
+                                .child(Self::force_button(view.clone())),
+                        )
                 });
             }
             _ => {
-                window.open_alert_dialog(cx, move |alert, _, _| {
+                window.open_alert_dialog(cx, move |alert, _, cx| {
                     alert
                         .confirm()
                         .title("设为默认播放器")
@@ -1108,9 +1139,50 @@ impl PlayerView {
                                 true
                             }
                         })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(
+                                            "高级：跳过系统设置，登记的同时直接把全部格式写成默认。\
+                                             这会绕过 Windows 的默认程序保护，系统大版本更新后可能失效。",
+                                        ),
+                                )
+                                .child(Self::force_button(view.clone())),
+                        )
                 });
             }
         }
+    }
+
+    /// 不管系统设置，直接写 `UserChoice` 把全部格式设为默认（见 ADR 0008）。
+    fn apply_force_defaults(&mut self, cx: &mut Context<Self>) {
+        let total = shell::extensions().len();
+        match shell::force_defaults() {
+            Ok(report) => {
+                self.shell_status = shell::status();
+                let text = if report.failures.is_empty() {
+                    format!("已把 {total} 种格式直接设为默认")
+                } else {
+                    format!(
+                        "已设 {} / {total} 种，{} 种失败（{}）",
+                        report.applied,
+                        report.failures.len(),
+                        report.failures.first().map(String::as_str).unwrap_or("-")
+                    )
+                };
+                self.notice = Some((text, Instant::now()));
+            }
+            Err(error) => {
+                self.notice = Some((format!("直接设为默认失败：{error:#}"), Instant::now()));
+            }
+        }
+        cx.notify();
     }
 
     fn apply_register(&mut self, cx: &mut Context<Self>) {

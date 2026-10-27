@@ -1,5 +1,8 @@
 # 默认播放器只登记，不代写 UserChoice
 
+> 已由 [ADR 0008](0008-force-default-is-an-explicit-opt-in.md) 修订：默认行为不变，
+> 但用户可以显式选择「直接设为默认」。
+
 Windows 8 之后，某个扩展名交给谁打开，最终由 `HKCU\…\FileExts\.<ext>\UserChoice` 裁定，
 其中的 ProgId 带一个校验值（算法未公开，与扩展名、用户 SID、时间戳相关）。程序自己写它
 属于劫持：系统更新后随机失效，还会被安全软件判成恶意行为。

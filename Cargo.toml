@@ -38,12 +38,19 @@ rustfft = "6"
 # 原生文件 / 文件夹选择对话框。注意它是**阻塞**的，必须在后台线程上弹。
 rfd = "0.15"
 
+# 算 Windows UserChoice 的哈希：系统只在它校验通过时才认「默认程序」这条记录。
+# 纯 Rust，本来就在依赖树里（别的 crate 已经带进来了），不增加编译成本。
+md-5 = "0.10"
+
 # 窗口激活（rfd 对话框提到前台）与文件关联登记（注册表 + Shell）。rfd 已经依赖
 # 同一版本，这里只是直接用它的绑定，不新增 crate。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Registry",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
