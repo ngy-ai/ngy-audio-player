@@ -69,8 +69,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - 超过就按职责拆成子模块，不要继续往上堆：新增代码时如果目标文件已经接近这个上限，
   先拆再改；拆分提交和功能提交要分开 `git commit`。
-- 现状提醒：`crates/app/src/ui/player_view.rs`（约 3800 行）、
-  `crates/app/src/shell.rs`（约 800 行）已超限，下次改动就先拆。
+- 现状提醒：目前没有超限文件。`crates/audio/src/engine.rs`（约 640 行）已接近上限，
+  下次改动前先拆；`crates/app/src/ui/player_view/` 与 `crates/app/src/shell/` 按职责
+  分成了多个文件，新增逻辑放对应子模块，不要再往 `view.rs` 或 `plan.rs` 里堆。
 - 拆分沿用现有布局（参考 `crates/app/src/ui/mod.rs`、`crates/audio/src/decode/mod.rs`）：
   - `foo.rs` 拆成 `foo/mod.rs` 加若干 `foo/*.rs`；子模块文件名按职责命名，
     不叫 `utils.rs` / `helpers.rs` 这类含糊名字（如 `decode/symphonia_backend.rs`）。
