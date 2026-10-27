@@ -546,25 +546,14 @@ pub fn unregister() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 程序被挪过位置之后，把注册表里写死的 exe 路径刷新过来。
+/// 启动时的「自动维护」：登记过就把整份登记幂等重写一遍。
 ///
-/// 只在「登记过」时动手：那条键存在就等于用户表达过意愿。路径悬空的后果是
-/// 双击音频文件什么都不发生，比没登记更难查。
+/// 只在「登记过」时动手——那条键存在就等于用户表达过意愿。要维护的东西有两个：
+/// 程序被挪过位置之后注册表里写死的 exe 路径（悬空的话双击文件什么都不会发生，
+/// 比没登记更难查），以及被别的程序顺手删掉的 OpenWithProgids 条目。
 #[cfg(windows)]
-pub fn refresh() -> anyhow::Result<()> {
+pub fn maintain() -> anyhow::Result<()> {
     if !win::exists(CAPABILITIES) {
-        return Ok(());
-    }
-    let exe = current_exe()?;
-    let stored = win::read(
-        &format!("Software\\Classes\\{PROG_ID}\\shell\\open\\command"),
-        None,
-    );
-    let wanted = plan(&exe)
-        .into_iter()
-        .find(|entry| entry.name.is_none() && entry.key.ends_with("shell\\open\\command"))
-        .map(|entry| entry.data);
-    if stored.is_some() && stored == wanted {
         return Ok(());
     }
     register()
@@ -707,7 +696,7 @@ pub fn unregister() -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn refresh() -> anyhow::Result<()> {
+pub fn maintain() -> anyhow::Result<()> {
     Ok(())
 }
 

@@ -125,6 +125,9 @@ enum MenuAction {
     OpenFiles,
     OpenFolder,
     DefaultPlayer,
+    OpenDefaultApps,
+    Unregister,
+    ToggleAutoMaintain,
     ToggleTheme,
     Quit,
 }
@@ -230,6 +233,8 @@ pub struct PlayerView {
     dialog_open: Option<&'static str>,
     /// 系统里的默认播放器状态。非 Windows 恒为 `Unsupported`，界面上不显示入口。
     shell_status: shell::Status,
+    /// 启动时自动维护文件关联（登记过才会动手），存在 `settings.txt` 里。
+    auto_maintain: bool,
     /// 播放列表保存位置；`None` 表示这次运行不持久化（单元测试）。
     library_path: Option<PathBuf>,
     focus: FocusHandle,
@@ -369,13 +374,14 @@ impl PlayerView {
             dialog_open: None,
             library_path: library_path(),
             shell_status: initial_shell_status(),
+            auto_maintain: read_setting("auto-maintain").is_none_or(|value| value != "0"),
             focus,
         };
 
         // 程序被挪过位置（换了构建产物目录）之后，注册表里写的还是旧路径：
         // 那样双击音频文件什么都不会发生，比没登记更难查。
-        if let Err(error) = shell::refresh() {
-            eprintln!("[shell] 刷新已登记的路径失败: {error:#}");
+        if let Some(Err(error)) = this.auto_maintain.then(shell::maintain) {
+            eprintln!("[shell] 维护文件关联失败: {error:#}");
         }
 
         // 上次退出时的播放列表先回来。
@@ -1204,18 +1210,53 @@ impl PlayerView {
     }
 
     fn apply_unregister(&mut self, cx: &mut Context<Self>) {
+        let was_registered = matches!(self.shell_status, shell::Status::Registered { .. });
         match shell::unregister() {
             Ok(()) => {
                 self.shell_status = shell::status();
-                self.notice = Some((
-                    "已取消登记，声波不再出现在「打开方式」里".into(),
-                    Instant::now(),
-                ));
+                let text = if was_registered {
+                    "已移除文件关联，声波不再出现在「打开方式」里"
+                } else {
+                    "本来就没有登记过文件关联"
+                };
+                self.notice = Some((text.into(), Instant::now()));
             }
             Err(error) => {
                 self.notice = Some((format!("取消登记失败：{error:#}"), Instant::now()));
             }
         }
+        cx.notify();
+    }
+
+    /// 「移除本程序的文件关联」：系统级副作用，先确认再动手。
+    fn confirm_unregister(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .confirm()
+                .title("移除文件关联")
+                .description(
+                    "会把声波从系统的「打开方式」里移除，已设为默认的类型会退回「询问用什么程序打开」。\
+                     下次还能重新登记。",
+                )
+                .ok_text("移除")
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text("取消")
+                .on_ok({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        if let Some(view) = view.upgrade() {
+                            view.update(cx, |this, cx| this.apply_unregister(cx));
+                        }
+                        true
+                    }
+                })
+        });
+    }
+
+    fn toggle_auto_maintain(&mut self, cx: &mut Context<Self>) {
+        self.auto_maintain = !self.auto_maintain;
+        write_setting("auto-maintain", if self.auto_maintain { "1" } else { "0" });
         cx.notify();
     }
 
@@ -1247,6 +1288,9 @@ impl PlayerView {
             MenuAction::OpenFiles => self.open_files(window, cx),
             MenuAction::OpenFolder => self.open_folder(window, cx),
             MenuAction::DefaultPlayer => self.open_default_dialog(window, cx),
+            MenuAction::OpenDefaultApps => self.reopen_settings(cx),
+            MenuAction::Unregister => self.confirm_unregister(window, cx),
+            MenuAction::ToggleAutoMaintain => self.toggle_auto_maintain(cx),
             MenuAction::ToggleTheme => self.toggle_theme(window, cx),
             MenuAction::Quit => window.remove_window(),
         }
@@ -1256,11 +1300,12 @@ impl PlayerView {
     /// 否则用户点完不知道有没有生效。
     fn default_player_entry(&self) -> (String, IconName, bool) {
         match self.shell_status {
+            // 带省略号：点它是弹确认层，不是立刻动手。
             shell::Status::Unsupported | shell::Status::Absent => {
-                ("设为默认播放器".to_string(), IconName::Settings, false)
+                ("设为默认音频播放器…".to_string(), IconName::Settings, false)
             }
             shell::Status::Registered { defaults, total } if total > 0 && defaults == total => {
-                ("已是默认播放器".to_string(), IconName::Settings, true)
+                ("已是默认音频播放器".to_string(), IconName::Settings, true)
             }
             shell::Status::Registered { defaults, total } if defaults > 0 => (
                 format!("已默认 {defaults}/{total} 种格式"),
@@ -1642,39 +1687,41 @@ impl PlayerView {
         };
 
         let (shell_label, shell_icon, shell_checked) = self.default_player_entry();
-        // 非 Windows 没有「默认播放器」这回事，整项不出现。
-        let has_default_player = !matches!(self.shell_status, shell::Status::Unsupported);
+        // 非 Windows 没有「默认播放器」这回事，整个「设置」菜单都不出现。
+        let supports_shell = !matches!(self.shell_status, shell::Status::Unsupported);
+        let total = shell::extensions().len();
+        // 状态行：登记是「能不能出现」，默认是「真的抢到没有」，两者分开说。
+        let status_text = match self.shell_status {
+            shell::Status::Unsupported => String::new(),
+            shell::Status::Absent => format!("已登记关联：0/{total} 个格式"),
+            shell::Status::Registered { defaults, .. } if defaults > 0 => {
+                format!("已登记关联：{total}/{total} 个格式 · 已默认 {defaults}")
+            }
+            shell::Status::Registered { .. } => format!("已登记关联：{total}/{total} 个格式"),
+        };
+        let auto_maintain = self.auto_maintain;
+
         let file_view = view.clone();
         let file_menu = top("menu-file-button", "文件").dropdown_menu(move |menu, _, _| {
-            let mut menu = menu
-                .item(menu_item(
-                    &file_view,
-                    MenuAction::OpenFiles,
-                    "打开文件…",
-                    Some(IconName::FilePlus),
-                    false,
-                ))
-                .item(menu_item(
-                    &file_view,
-                    MenuAction::OpenFolder,
-                    "打开文件夹…",
-                    Some(IconName::FolderOpen),
-                    false,
-                ));
-            if has_default_player {
-                menu = menu.separator().item(menu_item(
-                    &file_view,
-                    MenuAction::DefaultPlayer,
-                    shell_label.clone(),
-                    Some(shell_icon),
-                    shell_checked,
-                ));
-            }
-            menu.separator()
-                .item(menu_item(&file_view, MenuAction::Quit, "退出", None, false))
+            menu.item(menu_item(
+                &file_view,
+                MenuAction::OpenFiles,
+                "打开文件…",
+                Some(IconName::FilePlus),
+                false,
+            ))
+            .item(menu_item(
+                &file_view,
+                MenuAction::OpenFolder,
+                "打开文件夹…",
+                Some(IconName::FolderOpen),
+                false,
+            ))
+            .separator()
+            .item(menu_item(&file_view, MenuAction::Quit, "退出", None, false))
         });
 
-        let theme_view = view;
+        let theme_view = view.clone();
         let dark = self.dark;
         let view_menu = top("menu-view-button", "视图").dropdown_menu(move |menu, _, _| {
             menu.item(menu_item(
@@ -1686,6 +1733,42 @@ impl PlayerView {
             ))
         });
 
+        let settings_view = view;
+        let settings_menu = top("menu-settings-button", "设置").dropdown_menu(move |menu, _, _| {
+            menu.item(menu_item(
+                &settings_view,
+                MenuAction::DefaultPlayer,
+                shell_label.clone(),
+                Some(shell_icon),
+                shell_checked,
+            ))
+            .item(menu_item(
+                &settings_view,
+                MenuAction::OpenDefaultApps,
+                "打开系统默认应用设置",
+                None,
+                false,
+            ))
+            .separator()
+            .item(menu_item(
+                &settings_view,
+                MenuAction::Unregister,
+                "移除本程序的文件关联",
+                None,
+                false,
+            ))
+            .separator()
+            .item(menu_item(
+                &settings_view,
+                MenuAction::ToggleAutoMaintain,
+                "启动时自动维护关联",
+                None,
+                auto_maintain,
+            ))
+            .separator()
+            .item(PopupMenuItem::new(status_text.clone()).disabled(true))
+        });
+
         // `Button` 是 RenderOnce，挂不上 test_support；包一层给它一个可点中的身份。
         let slot = |id: &'static str, menu: AnyElement| div().id(id).test_support().child(menu);
 
@@ -1694,6 +1777,9 @@ impl PlayerView {
             .items_center()
             .child(slot("menu-file", file_menu.into_any_element()))
             .child(slot("menu-view", view_menu.into_any_element()))
+            .when(supports_shell, |this| {
+                this.child(slot("menu-settings", settings_menu.into_any_element()))
+            })
     }
 }
 
@@ -1761,6 +1847,41 @@ fn initial_shell_status() -> shell::Status {
         shell::Status::Unsupported
     } else {
         shell::status()
+    }
+}
+
+/// 设置文件：和库文件放同一个目录，一行一个 `key=value`。
+/// 只有几项设置，不值得为它引 JSON 依赖。
+fn settings_path() -> Option<PathBuf> {
+    library_path().map(|path| path.with_file_name("settings.txt"))
+}
+
+/// 读一项设置。文件不存在、没这一项都返回 `None`，由调用方决定默认值。
+fn read_setting(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(settings_path()?).ok()?;
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value.trim().to_string())
+}
+
+/// 改一项设置，其余行原样保留。
+fn write_setting(key: &str, value: &str) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.split_once('=').is_none_or(|(name, _)| name != key))
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{key}={value}"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = std::fs::write(&path, lines.join("\n") + "\n") {
+        eprintln!("[settings] 保存设置失败: {error}");
     }
 }
 
