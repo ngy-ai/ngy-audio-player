@@ -659,7 +659,16 @@ impl PlayerView {
         }
     }
 
-    fn toggle(&mut self, cx: &mut Context<Self>) {
+    /// 播放 / 暂停。
+    ///
+    /// 还没有当前曲目时（刚打开、或者正在播的那首刚被删掉），引擎里只有队列、
+    /// 没有装载任何东西，`toggle_pause` 会静默地什么都不做；这时从当前列表的
+    /// 第一首开始，点播放才有反应。
+    fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.playing.is_none() {
+            self.play_position(0, window, cx);
+            return;
+        }
         if let Some(player) = &self.player {
             player.toggle_pause();
             cx.notify();
@@ -2236,7 +2245,7 @@ impl Render for PlayerView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
-                    "space" => this.toggle(cx),
+                    "space" => this.toggle(window, cx),
                     "left" => this.seek_by(-5.0, cx),
                     "right" => this.seek_by(5.0, cx),
                     "up" => {
@@ -2853,7 +2862,7 @@ impl Render for PlayerView {
                         .w(px(44.0))
                         .h(px(44.0))
                         .icon(play_icon)
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx))),
                 ),
             )
             .child(
@@ -3071,6 +3080,52 @@ mod tests {
 
         let current = cx.update(|app| view.read(app).current_index());
         assert_eq!(current, Some(1), "点第二行之后当前曲目应当是它");
+    }
+
+    /// 刚打开程序时列表是从磁盘恢复的，没有任何当前曲目：点播放不能没反应。
+    #[gpui_kit::test]
+    fn play_button_starts_the_first_track_when_nothing_is_current(cx: &mut TestAppContext) {
+        let paths = samples();
+        if paths.len() < 2 {
+            eprintln!("跳过：缺少 testdata 样本");
+            return;
+        }
+
+        cx.update(gpui_kit::init);
+
+        let slot: Rc<RefCell<Option<Entity<PlayerView>>>> = Rc::new(RefCell::new(None));
+        let handle = {
+            let slot = slot.clone();
+            cx.add_window(move |window, cx| {
+                let view = cx.new(|cx| PlayerView::new(window, cx));
+                view.update(cx, |view, cx| {
+                    view.add_paths(paths.clone(), false, window, cx)
+                });
+                *slot.borrow_mut() = Some(view.clone());
+                Harness { view }
+            })
+        };
+
+        let view = slot.borrow().clone().expect("视图没有建出来");
+        // 删掉正在播的那首：列表还在、引擎也还有队列，但没有当前曲目。
+        cx.update(|app| view.update(app, |view, cx| view.remove_track(0, cx)));
+        assert_eq!(
+            cx.update(|app| view.read(app).current_index()),
+            None,
+            "删掉正在播的那首之后不该还有当前曲目"
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("play-slot", cx);
+        })
+        .unwrap();
+
+        assert_eq!(
+            cx.update(|app| view.read(app).current_index()),
+            Some(0),
+            "没有当前曲目时，点播放应当从列表第一首开始"
+        );
     }
 
     #[gpui_kit::test]
