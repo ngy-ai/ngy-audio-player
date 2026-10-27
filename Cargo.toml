@@ -1,67 +1,9 @@
+# 工作区根只放清单，源码都在 crates 下：app 是界面层，audio 是音频内核。
 [workspace]
-members = ["crates/audio"]
+members = ["crates/app", "crates/audio"]
 resolver = "3"
 
-[package]
-name = "ngy-audio-player"
-version = "0.1.0"
-edition = "2024"
-description = "跨平台音频播放器：基于 GPUI Kit，内置 Symphonia，系统 ffmpeg 兜底"
-license = "Apache-2.0"
-
-[lib]
-name = "ngy_audio_player"
-path = "src/lib.rs"
-
-[[bin]]
-name = "ngy-audio-player"
-path = "src/main.rs"
-
-[dependencies]
-# UI / 渲染：基于 Zed GPUI 的综合性桌面框架（Apache-2.0）。
-gpui-kit = "0.8"
-anyhow = "1"
-
-# 播放引擎（独立 crate，见 crates/audio）。
-ngy-audio-engine = { path = "crates/audio" }
-
-# 内嵌封面解码：jpeg/png/webp 足够覆盖常见专辑图。
-image = { version = "0.25", default-features = false, features = [
-    "jpeg",
-    "png",
-    "webp",
-] }
-
-# 频谱可视化。
-rustfft = "6"
-
-# 原生文件 / 文件夹选择对话框。注意它是**阻塞**的，必须在后台线程上弹。
-rfd = "0.15"
-
-# 算 Windows UserChoice 的哈希：系统只在它校验通过时才认「默认程序」这条记录。
-# 纯 Rust，本来就在依赖树里（别的 crate 已经带进来了），不增加编译成本。
-md-5 = "0.10"
-
-# 窗口激活（rfd 对话框提到前台）与文件关联登记（注册表 + Shell）。rfd 已经依赖
-# 同一版本，这里只是直接用它的绑定，不新增 crate。
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_System_Registry",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
-[dev-dependencies]
-gpui-kit = { version = "0.8", features = ["test-support"] }
-
-# Windows 可执行文件图标资源。gpui 自己也是用它编译 manifest，不引入新依赖。
-[build-dependencies]
-embed-resource = "3"
-
+# 编译配置必须留在工作区根清单里，成员 crate 里写无效。
 [profile.release]
 opt-level = 3
 # 这里刻意不用 fat LTO + codegen-units=1：GPUI 依赖树很大，那种配置会让每个

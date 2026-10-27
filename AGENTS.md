@@ -16,7 +16,9 @@
 ## 目录结构
 
 ```
-src/                    界面层：app、列表 / 封面 / 进度 / 传输控制 / 频谱
+crates/app/             界面层：app、列表 / 封面 / 进度 / 传输控制 / 频谱
+crates/app/assets/      应用图标与 Windows 资源文件（build.rs 编译进 exe）
+crates/app/src/         lib + bin，crate 名仍是 ngy-audio-player
 crates/audio/           音频内核：decode、resample、output、state、engine、meta
 crates/audio/tests/     真实格式解码测试、真实设备播放测试
 testdata/               测试样本，音频文件不入库（见 testdata/README.md）
@@ -24,13 +26,17 @@ scripts/shot.py         Windows 窗口截图 / 点击辅助脚本
 docs/                   截图等文档资源
 ```
 
+根 `Cargo.toml` 是虚拟工作区清单（成员只有 `crates/app`、`crates/audio`，
+profile 配置也在这里），根目录不放源码。
+
 ## 常用命令
 
 ```bash
-cargo run --release                  # 空界面，拖文件进去
+cargo run --release                  # 空界面，拖文件进去（等价 -p ngy-audio-player）
 cargo run --release -- a.mp3 b.flac  # 直接播放
 cargo build --release
 cargo test --workspace
+cargo test -p ngy-audio-player
 cargo test -p ngy-audio-engine
 cargo test -p ngy-audio-engine --test formats -- --nocapture
 cargo test -p ngy-audio-engine --test playback -- --nocapture
@@ -63,9 +69,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - 超过就按职责拆成子模块，不要继续往上堆：新增代码时如果目标文件已经接近这个上限，
   先拆再改；拆分提交和功能提交要分开 `git commit`。
-- 现状提醒：`src/ui/player_view.rs`（约 3800 行）、`src/shell.rs`（约 800 行）已超限，
-  下次改动就先拆。
-- 拆分沿用现有布局（参考 `src/ui/mod.rs`、`crates/audio/src/decode/mod.rs`）：
+- 现状提醒：`crates/app/src/ui/player_view.rs`（约 3800 行）、
+  `crates/app/src/shell.rs`（约 800 行）已超限，下次改动就先拆。
+- 拆分沿用现有布局（参考 `crates/app/src/ui/mod.rs`、`crates/audio/src/decode/mod.rs`）：
   - `foo.rs` 拆成 `foo/mod.rs` 加若干 `foo/*.rs`；子模块文件名按职责命名，
     不叫 `utils.rs` / `helpers.rs` 这类含糊名字（如 `decode/symphonia_backend.rs`）。
   - `mod.rs` 只放模块文档、`mod` 声明和对外重新导出（`pub use`），不放实现；

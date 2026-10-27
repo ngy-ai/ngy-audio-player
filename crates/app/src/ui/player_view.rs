@@ -3012,7 +3012,8 @@ mod tests {
     }
 
     fn samples() -> Vec<PathBuf> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        // 样本在工作区根，不在 crate 目录里。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
         ["tone.flac", "tone.mp3", "tone.opus"]
             .iter()
             .map(|name| dir.join(name))

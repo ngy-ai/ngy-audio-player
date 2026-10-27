@@ -1,4 +1,4 @@
-"""生成应用图标：assets/icon.png 与多尺寸 assets/icon.ico。
+"""生成应用图标：crates/app/assets/icon.png 与多尺寸 crates/app/assets/icon.ico。
 
 设计是紫 → 靛 → 青的渐变圆角方块，中间是白色声波柱。
 小尺寸（16/24/32）单独改用三根更粗的柱子，避免缩小时糊成一团。
@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 ROOT = Path(__file__).resolve().parent.parent
-ASSETS = ROOT / "assets"
+ASSETS = ROOT / "crates" / "app" / "assets"
 
 # 渐变停点：左上紫、中部靛蓝、右下青。
 STOPS = (

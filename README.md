@@ -94,16 +94,20 @@ cargo run --release -- a.mp3 b.flac # 直接播
 ## 结构
 
 ```
+crates/app/              界面层（crate 名依旧是 ngy-audio-player）
+  src/ui/player_view.rs  列表 / 封面 / 进度 / 传输控制
+  src/ui/spectrum.rs     频谱柱
+  src/shell.rs           窗口、菜单、文件关联
+  assets/                图标与 Windows 资源文件
 crates/audio/            音频内核（不依赖 GPUI，可单独测试）
   src/decode/            两条解码路径，统一成 2 声道交错 f32
   src/resample.rs        设备采样率不一致时做 FFT 重采样
   src/output.rs          cpal 输出 + 无锁环形缓冲
   src/state.rs           音频线程与 UI 之间唯一的共享面（原子量）
   src/engine.rs          线程模型与状态机
-src/                     界面层
-  src/ui/player_view.rs  列表 / 封面 / 进度 / 传输控制
-  src/ui/spectrum.rs     频谱柱
 ```
+
+根 `Cargo.toml` 只是工作区的虚拟清单，源码都在 `crates/` 下。
 
 线程模型一句话：**解码线程写、音频回调读，中间只有一个环形缓冲**。回调里不加锁、
 不分配、不做 IO；位置时钟由回调按「实际写出的帧数」推进，所以暂停时进度条不会自己走。
