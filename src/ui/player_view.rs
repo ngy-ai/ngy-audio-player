@@ -2676,11 +2676,12 @@ impl Render for PlayerView {
                             .child(duration_text),
                     )
                     .child(
-                        // 拖拽手柄只是个提示：真正可拖的是整行。
+                        // 拖拽手柄只是个提示：真正可拖的是整行。和操作按钮一样，
+                        // 平时不显示，鼠标落在这一行才淡入。
                         div()
                             .flex_none()
-                            .opacity(0.35)
-                            .group_hover(row_group.clone(), |this| this.opacity(0.8))
+                            .opacity(0.0)
+                            .group_hover(row_group.clone(), |this| this.opacity(1.0))
                             .child(
                                 Icon::new(IconName::GripVertical)
                                     .size(px(14.0))
@@ -2692,9 +2693,10 @@ impl Render for PlayerView {
                             .flex_none()
                             .gap_0p5()
                             .items_center()
-                            // 平时淡一点，鼠标落在这一行才完全显出来：
-                            // 一直亮着的小图标会把标题挤得没有呼吸空间。
-                            .opacity(0.35)
+                            // 平时完全不显示，鼠标落在这一行才淡入：一直亮着的小图标
+                            // 会把标题挤得没有呼吸空间。位置留着，所以不会引起布局跳动；
+                            // 指针要落到这上面，必须先落在行上，此时已经显出来了。
+                            .opacity(0.0)
                             .group_hover(row_group, |this| this.opacity(1.0))
                             .child(action("track-up", IconName::ChevronUp, "上移").on_click(
                                 cx.listener(move |this, _, _, cx| {
