@@ -35,5 +35,14 @@ cargo test -p ngy-audio-engine --test formats -- --nocapture
 
 它会打印每个文件走的是 `Symphonia` 还是 `FFmpeg`，并检查解出来的时长是否合理。
 
-APE 不在列表里：ffmpeg 只有 APE 解码器、没有编码器，生成不出样本。想补的话，
-从本机找一首 `.ape` 拷进来即可，测试会自动纳入。
+APE 另走一条路：ffmpeg 只有解码器、没有编码器，生成不出来，用 ffmpeg 自己的测试文件：
+
+```bash
+curl -O https://samples.ffmpeg.org/A-codecs/lossless/luckynight.ape
+```
+
+60 秒、44.1 kHz 立体声，正好满足 `tone.*` 之外「时长 ≥ 30 秒」那条规则。它同时是
+「内置解码器必须让路」的回归样本：APE 的描述区里抄着一份原始 WAV 头，探测器只认
+文件头，才不会把这个文件当成 WAV。
+
+本机要是已经有别的 `.ape` 曲目，拷进来也行，只要长于 30 秒。

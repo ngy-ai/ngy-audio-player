@@ -28,7 +28,7 @@ tone.aac        Symphonia   44100 Hz  1.231s      tone.opus       FFmpeg  48000 
 tone.m4a        Symphonia   44100 Hz  1.231s      tone.spx        FFmpeg  48000 Hz  1.200s
 tone_alac.m4a   Symphonia   44100 Hz  1.200s      tone.wma        FFmpeg  48000 Hz  1.161s
 tone.flac       Symphonia   44100 Hz  1.200s      tone.wv         FFmpeg  48000 Hz  1.200s
-tone.mp3        Symphonia   44100 Hz  1.200s      tone.ape*       需要样本，未入测试
+tone.mp3        Symphonia   44100 Hz  1.200s      luckynight.ape  FFmpeg  48000 Hz  60.480s
 tone.ogg        Symphonia   44100 Hz  1.200s      tone.ac3        FFmpeg  48000 Hz  1.219s
 tone.wav        Symphonia   44100 Hz  1.200s      tone.tta        FFmpeg  48000 Hz  1.200s
 tone.aiff       Symphonia   44100 Hz  1.200s      tone.amr        FFmpeg  48000 Hz  1.220s
@@ -37,7 +37,8 @@ tone.mka        Symphonia   44100 Hz  1.220s      tone.w64        FFmpeg  48000 
 tone.3gp        Symphonia   44100 Hz  1.231s
 ```
 
-（`*` APE 只有解码器没有编码器，ffmpeg 生成不出样本，所以没进自动化测试。）
+（APE 这行用的是 ffmpeg 自己的测试文件：APE 只有解码器没有编码器，现场生成不出来，
+下载命令见 [testdata/README.md](testdata/README.md)。）
 
 ## ffmpeg 是可选的
 

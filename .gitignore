@@ -18,5 +18,6 @@
 /testdata/*.au
 /testdata/*.w64
 /testdata/*.3gp
+/testdata/*.ape
 /testdata/*.bin
 .DS_Store

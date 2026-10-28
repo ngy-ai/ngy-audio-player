@@ -7,13 +7,14 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::probe::{Hint, Probe, ProbeOptions};
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -25,6 +26,27 @@ use crate::meta::TimeWindow;
 /// 末尾留的余量。几个解码器在精确末帧 seek 会报 EOF / out-of-range，
 /// 而标签探测出的时长又常比容器真实帧数长几毫秒到几十毫秒。
 const SEEK_END_MARGIN: Duration = Duration::from_millis(50);
+
+/// 探测器只在文件开头这么多个字节里找容器标记。
+///
+/// Symphonia 默认会拿每个容器的 marker 在前 1 MB 里**逐字节扫描**，谁先撞上就算谁的。
+/// 这在一种文件上会翻车：APE 的描述区后面抄着一份原始 WAV 头（`RIFF…WAVE`，
+/// 现成样本里落在第 224 字节），于是整个 APE 被当成 WAV 从那里开始解——解出来的是
+/// 压缩数据，60 秒的曲子变成 37 秒噪音，从来没轮到 ffmpeg。
+///
+/// 容器头只可能出现在开头（MP4 的 `ftyp` 在第 4 字节），留 16 字节足够。
+/// 真有文件带着更长的前导垃圾时，探测会失败并自然落到 ffmpeg，不会比现在更差。
+const PROBE_DEPTH: u32 = 16;
+
+/// 只认文件头的探测器，建一次就够。
+static PROBE: LazyLock<Probe> = LazyLock::new(|| {
+    let mut probe = Probe::new_with_options(&ProbeOptions {
+        max_probe_depth: PROBE_DEPTH,
+        ..Default::default()
+    });
+    symphonia::default::register_enabled_formats(&mut probe);
+    probe
+});
 
 pub struct SymphoniaDecoder {
     reader: Box<dyn FormatReader>,
@@ -56,7 +78,7 @@ pub fn open(path: &Path, window: Option<TimeWindow>) -> anyhow::Result<Box<dyn D
         hint.with_extension(ext);
     }
 
-    let reader = symphonia::default::get_probe()
+    let reader = PROBE
         .probe(
             &hint,
             stream,
@@ -121,8 +143,8 @@ pub fn open(path: &Path, window: Option<TimeWindow>) -> anyhow::Result<Box<dyn D
             .context("分轨起点超出文件范围")?;
     }
 
-    // 试解一块再算成功。Symphonia 对裸 MPEG 音频（mp3 / ADTS）的探测非常宽松，
-    // 任意二进制都可能被判成「音频流」——真解出样本才算这个文件能播。
+    // 试解一块再算成功。文件头对了也还不够：Symphonia 对裸 MPEG 音频（mp3 / ADTS）
+    // 的探测非常宽松，容器参数能读出来不代表里面真有数据——真解出样本才算能播。
     match decoder.next_chunk() {
         Ok(Some(chunk)) => decoder.primer = Some(chunk),
         Ok(None) => bail!("文件里没有可解码的音频数据"),
@@ -264,4 +286,55 @@ fn seekable_end(track: &Track) -> Option<Duration> {
     let end = time_base.calc_time(end_ts)?;
     let seconds = end.as_secs_f64();
     (seconds > 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个「藏着 WAV 头」的文件：真实样本里是 APE 描述区抄的原始 WAV 头。
+    fn wav_header_buried_at_224() -> Vec<u8> {
+        let samples: Vec<i16> = (0..1600)
+            .map(|index| ((index as f32 * 0.05).sin() * 8000.0) as i16)
+            .collect();
+        let data_len = (samples.len() * 2) as u32;
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in &samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let mut file = b"MAC ".to_vec(); // APE 的文件头
+        file.resize(224, 0);
+        file.extend_from_slice(&wav);
+        file
+    }
+
+    /// 探测器曾经会在文件中间找容器标记，把「里面藏着 WAV 头」的文件整个认领下来。
+    #[test]
+    fn container_marker_in_the_middle_is_ignored() {
+        let path =
+            std::env::temp_dir().join(format!("ngy-audio-embedded-wav-{}.bin", std::process::id()));
+        std::fs::write(&path, wav_header_buried_at_224()).unwrap();
+
+        let opened = open(&path, None);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            opened.is_err(),
+            "内置解码器把藏在第 224 字节的 WAV 头当成了这个文件的容器"
+        );
+    }
 }
